@@ -1,0 +1,8 @@
+*
+!pyproject.toml
+!uv.lock
+!README.md
+!teem/
+!teem/**
+teem/**/__pycache__/
+teem/**/*.pyc

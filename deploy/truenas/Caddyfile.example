@@ -1,0 +1,12 @@
+teem.example.com {
+    @audio path /transcribe
+    request_body @audio {
+        max_size 8MiB
+    }
+
+    reverse_proxy 127.0.0.1:8765 {
+        transport http {
+            read_timeout 120s
+        }
+    }
+}
