@@ -5,6 +5,7 @@ import hashlib
 import http.client
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -74,10 +75,27 @@ class SliceAcceptance(unittest.TestCase):
         self.base = run("git", "rev-parse", "HEAD", cwd=self.repo)
         self.checks = [{"name": "content", "argv": ["/usr/bin/python3", "/workspace/check.py"]}]
         from teem.common import canonical, digest
+        self.reviewer_config = {"identity": "test-reviewer-v1", "instructions": "Review the exact candidate against the criteria.",
+                                "destination": "local", "timeout": 30}
+        self.reviewer_file = self.root / "reviewer.json"
+        self.reviewer_file.write_text(json.dumps(self.reviewer_config))
+        self.reviewer = self.root / "reviewer"
+        self.reviewer.write_text(
+            "#!/usr/bin/python3\nimport json\n"
+            "with open('/context.json') as f: context=json.load(f)\n"
+            "pack=context['pack']\n"
+            "print(json.dumps({'candidate_id':pack['candidate_id'],"
+            "'contract_version':pack['contract_version'],'context_sha256':context['sha256'],"
+            "'verdict':'pass','summary':'Criteria met','findings':[],'uncertainties':[]}))\n")
+        self.reviewer.chmod(0o755)
+        reviewer_policy = {"identity": self.reviewer_config["identity"],
+                           "instructions_sha256": hashlib.sha256(self.reviewer_config["instructions"].encode()).hexdigest(),
+                           "destination": "local", "timeout": 30, "executable": str(self.reviewer)}
         with connect(self.dsn) as conn:
             conn.execute("INSERT INTO projects(id,name,base_commit,checks,check_hash) VALUES (%s,'Test',%s,%s::jsonb,%s)",
                          (self.project_id, self.base, canonical(self.checks), digest(self.checks)))
-        projects = {self.project_id: {"repo": str(self.repo), "coder": ["/usr/bin/python3", "/workspace/coder.py"], "checks": self.checks}}
+        projects = {self.project_id: {"repo": str(self.repo), "coder": ["/usr/bin/python3", "/workspace/coder.py"],
+                                      "checks": self.checks, "reviewer": reviewer_policy}}
         config = self.root / "projects.json"
         config.write_text(json.dumps(projects))
         args = type("Args", (), {"url": "https://example.invalid", "token": "worker-secret", "worker_id": "worker",
@@ -95,7 +113,8 @@ class SliceAcceptance(unittest.TestCase):
     def start_server(self):
         args = type("Args", (), {"dsn": self.dsn, "artifacts": str(self.root / "artifacts"),
                                     "username": "user", "password": "password", "worker_id": "worker",
-                                    "worker_token": "worker-secret", "origin": "https://teem.test"})()
+                                    "worker_token": "worker-secret", "origin": "https://teem.test",
+                                    "reviewer_config": str(self.reviewer_file)})()
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.server.app = App(args)
         self.url = f"http://127.0.0.1:{self.server.server_port}"
@@ -111,6 +130,36 @@ class SliceAcceptance(unittest.TestCase):
         self.worker.journal.db.close()
         self.worker = Worker(self.worker_args)
         self.worker.api.url = self.url
+
+    def propose(self, revisions=2):
+        status, headers, _ = self.browser("POST", "/requests", {"project": self.project_id,
+            "objective": "Change value", "criteria": "value.txt contains a reviewed result", "revisions": str(revisions)})
+        self.assertEqual(status, 303)
+        path = headers["Location"]
+        self.assertEqual(self.browser("POST", path + "/approve", {"version": "1", "decision": "approve"})[0], 303)
+        return path
+
+    def claim_and_execute(self):
+        assignment = self.worker.api.call("POST", "/worker/claim", {"worker_id": "worker",
+            "capabilities": ["code", "check", "bundle", "review"]})["assignment"]
+        self.assertIsNotNone(assignment)
+        self.assertTrue(self.worker.journal.accept(assignment))
+        self.worker.execute(assignment)
+        return assignment
+
+    def reviewer_verdict(self, verdict):
+        self.reviewer.write_text(
+            "#!/usr/bin/python3\nimport json\nfrom pathlib import Path\n"
+            "context=json.loads(Path('/context.json').read_text())\npack=context['pack']\n"
+            "finding={'criterion':pack['acceptance_criteria'],'description':'Outcome missing',"
+            "'evidence':[{'kind':'source','path':'value.txt','start_line':1,'end_line':1}]}\n"
+            f"verdict={verdict!r}\n"
+            "print(json.dumps({'candidate_id':pack['candidate_id'],"
+            "'contract_version':pack['contract_version'],'context_sha256':context['sha256'],"
+            "'verdict':verdict,'summary':'Review completed',"
+            "'findings':[finding] if verdict=='changes_required' else [],"
+            "'uncertainties':['Cannot establish criterion'] if verdict=='blocked' else []}))\n")
+        self.reviewer.chmod(0o755)
 
     def browser(self, method, path, body=None):
         from urllib.parse import urlencode
@@ -137,14 +186,15 @@ class SliceAcceptance(unittest.TestCase):
         self.assertEqual(self.browser("POST", "/requests", {"project": self.project_id, "objective": "Change value",
             "criteria": "value.txt contains after", "dedupe_key": "request-1"})[1]["Location"], path)
         self.assertIsNone(self.worker.api.call("POST", "/worker/claim", {"worker_id": "worker",
-            "capabilities": ["code", "check", "bundle"]})["assignment"])
+            "capabilities": ["code", "check", "bundle", "review"]})["assignment"])
         with connect(self.dsn) as conn:
-            self.assertEqual(conn.execute("SELECT count(*) FROM approvals").fetchone()["count"], 0)
+            self.assertEqual(conn.execute("SELECT count(*) FROM approvals WHERE run_id=%s",
+                                          (run_id,)).fetchone()["count"], 0)
         self.assertEqual(self.browser("POST", path + "/approve", {"version": "1", "decision": "approve"})[0], 303)
         assignment = self.worker.api.call("POST", "/worker/claim", {"worker_id": "worker",
-            "capabilities": ["code", "check", "bundle"]})["assignment"]
+            "capabilities": ["code", "check", "bundle", "review"]})["assignment"]
         redelivered = self.worker.api.call("POST", "/worker/claim", {"worker_id": "worker",
-            "capabilities": ["code", "check", "bundle"]})["assignment"]
+            "capabilities": ["code", "check", "bundle", "review"]})["assignment"]
         self.assertEqual(redelivered, assignment)
         self.assertTrue(self.worker.journal.accept(assignment))
         self.assertFalse(self.worker.journal.accept(assignment))
@@ -174,11 +224,12 @@ class SliceAcceptance(unittest.TestCase):
         with connect(self.dsn) as conn:
             attempt = conn.execute("SELECT status,usage FROM attempts WHERE id=%s", (assignment["attempt_id"],)).fetchone()
             self.assertEqual(attempt["status"], "running", attempt["usage"])
-            self.assertEqual(conn.execute("SELECT count(*) FROM candidates").fetchone()["count"], 0)
+            self.assertEqual(conn.execute("SELECT count(*) FROM candidates WHERE run_id=%s",
+                                          (run_id,)).fetchone()["count"], 0)
             conn.execute("UPDATE attempts SET lease_until=now()-interval '1 second' WHERE id=%s", (assignment["attempt_id"],))
         self.assertIn(b"uncertain", self.browser("GET", path)[2])
         self.assertIsNone(self.worker.api.call("POST", "/worker/claim", {"worker_id": "worker",
-            "capabilities": ["code", "check", "bundle"]})["assignment"])
+            "capabilities": ["code", "check", "bundle", "review"]})["assignment"])
         self.assertEqual(self.browser("POST", path + "/retry", {})[0], 409)
         self.restart_worker()
         self.worker.reconcile()
@@ -189,7 +240,8 @@ class SliceAcceptance(unittest.TestCase):
             candidate = conn.execute("SELECT * FROM candidates WHERE run_id=%s", (run_id,)).fetchone()
             self.assertEqual(candidate["evidence"]["checks"][0]["exit_code"], 0)
             self.assertEqual(candidate["evidence"]["head_commit"], candidate["head_commit"])
-            self.assertEqual(conn.execute("SELECT count(*) FROM attempts").fetchone()["count"], 1)
+            self.assertEqual(conn.execute("""SELECT count(*) FROM attempts a JOIN tasks t ON t.id=a.task_id
+                                             WHERE t.run_id=%s""", (run_id,)).fetchone()["count"], 1)
             self.assertEqual(conn.execute("SELECT count(*) FROM events WHERE run_id=%s", (run_id,)).fetchone()["count"] > 5, True)
         import shutil
         shutil.rmtree(self.root / "worker" / ("attempt-" + assignment["attempt_id"]))
@@ -216,7 +268,7 @@ class SliceAcceptance(unittest.TestCase):
         path = headers["Location"]
         self.assertEqual(self.browser("POST", path + "/approve", {"version": "1", "decision": "approve"})[0], 303)
         assignment = self.worker.api.call("POST", "/worker/claim", {"worker_id": "worker",
-            "capabilities": ["code", "check", "bundle"]})["assignment"]
+            "capabilities": ["code", "check", "bundle", "review"]})["assignment"]
         self.assertTrue(self.worker.journal.accept(assignment))
         self.worker.execute(assignment)
         self.assertIn(b"checks_failed", self.browser("GET", path)[2])
@@ -231,7 +283,7 @@ class SliceAcceptance(unittest.TestCase):
         self.assertEqual(self.browser("POST", cancel_path + "/cancel", {})[0], 303)
         self.assertIn(b"cancelled", self.browser("GET", cancel_path)[2])
         self.assertIsNone(self.worker.api.call("POST", "/worker/claim", {"worker_id": "worker",
-            "capabilities": ["code", "check", "bundle"]})["assignment"])
+            "capabilities": ["code", "check", "bundle", "review"]})["assignment"])
 
     def test_expired_accepted_attempt_requires_reconciliation_before_retry(self):
         status, headers, _ = self.browser("POST", "/requests", {"project": self.project_id,
@@ -240,12 +292,12 @@ class SliceAcceptance(unittest.TestCase):
         path = headers["Location"]
         self.assertEqual(self.browser("POST", path + "/approve", {"version": "1", "decision": "approve"})[0], 303)
         assignment = self.worker.api.call("POST", "/worker/claim", {"worker_id": "worker",
-            "capabilities": ["code", "check", "bundle"]})["assignment"]
+            "capabilities": ["code", "check", "bundle", "review"]})["assignment"]
         self.assertTrue(self.worker.journal.accept(assignment))
         with connect(self.dsn) as conn:
             conn.execute("UPDATE attempts SET lease_until=now()-interval '1 second' WHERE id=%s", (assignment["attempt_id"],))
         self.assertIsNone(self.worker.api.call("POST", "/worker/claim", {"worker_id": "worker",
-            "capabilities": ["code", "check", "bundle"]})["assignment"])
+            "capabilities": ["code", "check", "bundle", "review"]})["assignment"])
         self.assertEqual(self.browser("POST", path + "/retry", {})[0], 409)
         self.restart_worker()
         self.worker.reconcile()
@@ -255,7 +307,7 @@ class SliceAcceptance(unittest.TestCase):
             self.assertEqual(attempt["status"], "reconciled_uncertain")
         self.assertEqual(self.browser("POST", path + "/retry", {})[0], 303)
         replacement = self.worker.api.call("POST", "/worker/claim", {"worker_id": "worker",
-            "capabilities": ["code", "check", "bundle"]})["assignment"]
+            "capabilities": ["code", "check", "bundle", "review"]})["assignment"]
         self.assertNotEqual(replacement["attempt_id"], assignment["attempt_id"])
         self.assertEqual(replacement["generation"], assignment["generation"] + 1)
         with self.assertRaises(WorkerError):
@@ -291,7 +343,7 @@ class SliceAcceptance(unittest.TestCase):
             "worker.api.url = sys.argv[3]\n"
             "worker.reconcile()\n"
             "assignment = worker.api.call('POST', '/worker/claim', "
-            "{'worker_id': 'worker', 'capabilities': ['code', 'check', 'bundle']})['assignment']\n"
+            "{'worker_id': 'worker', 'capabilities': ['code', 'check', 'bundle', 'review']})['assignment']\n"
             "if assignment and worker.journal.accept(assignment):\n"
             "    worker.execute(assignment)\n"
         )
@@ -382,7 +434,7 @@ class SliceAcceptance(unittest.TestCase):
         path = headers["Location"]
         self.assertEqual(self.browser("POST", path + "/approve", {"version": "1", "decision": "approve"})[0], 303)
         assignment = self.worker.api.call("POST", "/worker/claim", {"worker_id": "worker",
-            "capabilities": ["code", "check", "bundle"]})["assignment"]
+            "capabilities": ["code", "check", "bundle", "review"]})["assignment"]
         self.assertTrue(self.worker.journal.accept(assignment))
         original = self.worker.api.call
         renewals = 0
@@ -411,7 +463,7 @@ class SliceAcceptance(unittest.TestCase):
         path = headers["Location"]
         self.assertEqual(self.browser("POST", path + "/approve", {"version": "1", "decision": "approve"})[0], 303)
         assignment = self.worker.api.call("POST", "/worker/claim", {"worker_id": "worker",
-            "capabilities": ["code", "check", "bundle"]})["assignment"]
+            "capabilities": ["code", "check", "bundle", "review"]})["assignment"]
         self.assertTrue(self.worker.journal.accept(assignment))
         observed = {}
 
@@ -471,7 +523,7 @@ class SliceAcceptance(unittest.TestCase):
                 return getattr(self.connection, name)
 
             def execute(self, query, params=None):
-                if query.startswith("UPDATE runs SET status='coding'"):
+                if query.startswith("UPDATE runs SET status=%s") and params[0] == "coding":
                     claim_paused.set()
                     if not resume_claim.wait(10):
                         raise TimeoutError("claim was not resumed")
@@ -489,7 +541,7 @@ class SliceAcceptance(unittest.TestCase):
         def claim():
             try:
                 observed["assignment"] = self.worker.api.call("POST", "/worker/claim",
-                    {"worker_id": "worker", "capabilities": ["code", "check", "bundle"]})["assignment"]
+                    {"worker_id": "worker", "capabilities": ["code", "check", "bundle", "review"]})["assignment"]
             except Exception as exc:
                 observed["claim_error"] = exc
 
@@ -537,7 +589,7 @@ class SliceAcceptance(unittest.TestCase):
         path = headers["Location"]
         self.assertEqual(self.browser("POST", path + "/approve", {"version": "1", "decision": "approve"})[0], 303)
         assignment = self.worker.api.call("POST", "/worker/claim", {"worker_id": "worker",
-            "capabilities": ["code", "check", "bundle"]})["assignment"]
+            "capabilities": ["code", "check", "bundle", "review"]})["assignment"]
         self.assertTrue(self.worker.journal.accept(assignment))
         original = self.worker.api.call
 
@@ -556,6 +608,677 @@ class SliceAcceptance(unittest.TestCase):
             self.assertEqual(attempt["status"], "reconciled_uncertain")
             self.assertEqual(conn.execute("SELECT count(*) FROM candidates WHERE run_id=%s", (path.split("/")[-1],)).fetchone()["count"], 0)
         self.assertIn(b"uncertain", self.browser("GET", path)[2])
+
+    def test_review_direct_pass_and_conflicting_replay_blocks_readiness(self):
+        path = self.propose(revisions=0)
+        coding = self.claim_and_execute()
+        self.assertEqual(coding["kind"], "code_and_check")
+        self.stop_server()
+        self.start_server()
+        self.worker.api.url = self.url
+        review = self.claim_and_execute()
+        self.assertEqual(review["kind"], "review")
+        self.assertIn(b"Ready to merge", self.browser("GET", path)[2])
+        with connect(self.dsn) as conn:
+            run_row = conn.execute("SELECT * FROM runs WHERE id=%s", (path.split("/")[-1],)).fetchone()
+            candidate = conn.execute("SELECT * FROM candidates WHERE id=%s", (run_row["current_candidate_id"],)).fetchone()
+            evidence = conn.execute("SELECT * FROM reviews WHERE attempt_id=%s", (review["attempt_id"],)).fetchone()
+            self.assertEqual(evidence["disposition"], "accepted")
+            self.assertEqual(evidence["result"]["candidate_id"], str(candidate["id"]))
+            first_count = conn.execute("SELECT count(*) FROM events WHERE run_id=%s", (run_row["id"],)).fetchone()["count"]
+        report = json.loads(self.worker.journal.db.execute("SELECT result FROM attempts WHERE id=?",
+                                                      (review["attempt_id"],)).fetchone()[0])
+        self.assertTrue(self.worker.api.call("POST", "/worker/report/" + review["attempt_id"],
+                                             report)["replay"])
+        with connect(self.dsn) as conn:
+            self.assertEqual(conn.execute("SELECT count(*) FROM events WHERE run_id=%s", (run_row["id"],)).fetchone()["count"], first_count)
+        report["raw_output"] += " "
+        with self.assertRaises(WorkerError):
+            self.worker.api.call("POST", "/worker/report/" + review["attempt_id"], report)
+        with connect(self.dsn) as conn:
+            self.assertEqual(conn.execute("SELECT status,stop_reason FROM runs WHERE id=%s", (run_row["id"],)).fetchone(),
+                             {"status": "blocked", "stop_reason": "integrity_failure"})
+
+    def test_candidate_report_conflict_before_review_pass_blocks_readiness(self):
+        path = self.propose(revisions=0)
+        coding = self.claim_and_execute()
+        review = self.worker.api.call("POST", "/worker/claim", {"worker_id": "worker",
+            "capabilities": ["code", "check", "bundle", "review"]})["assignment"]
+        report = json.loads(self.worker.journal.db.execute("SELECT result FROM attempts WHERE id=?",
+                                                      (coding["attempt_id"],)).fetchone()[0])
+        report["usage"]["conflict"] = True
+        with self.assertRaises(WorkerError):
+            self.worker.api.call("POST", "/worker/report/" + coding["attempt_id"],
+                                 {key: value for key, value in report.items() if key != "bundle"})
+        self.assertTrue(self.worker.journal.accept(review))
+        self.worker.execute(review)
+        with connect(self.dsn) as conn:
+            run_row = conn.execute("SELECT status,stop_reason FROM runs WHERE id=%s", (path.split("/")[-1],)).fetchone()
+            evidence = conn.execute("SELECT disposition,result FROM reviews WHERE attempt_id=%s",
+                                    (review["attempt_id"],)).fetchone()
+            self.assertEqual(run_row, {"status": "blocked", "stop_reason": "integrity_failure"})
+            self.assertEqual((evidence["disposition"], evidence["result"]["verdict"]), ("accepted", "pass"))
+
+    def test_cancellation_reconnect_preserves_unsent_candidate_and_review(self):
+        path = self.propose()
+        coding = self.worker.api.call("POST", "/worker/claim", {"worker_id": "worker",
+            "capabilities": ["code", "check", "bundle", "review"]})["assignment"]
+        self.assertTrue(self.worker.journal.accept(coding))
+        with patch.object(self.worker, "send_result", side_effect=WorkerError("ack lost")):
+            self.worker.execute(coding)
+        self.assertEqual(self.browser("POST", path + "/cancel", {})[0], 303)
+        self.restart_worker()
+        self.worker.reconcile()
+        with connect(self.dsn) as conn:
+            run_row = conn.execute("SELECT status,current_candidate_id FROM runs WHERE id=%s",
+                                   (path.split("/")[-1],)).fetchone()
+            candidate = conn.execute("SELECT id FROM candidates WHERE attempt_id=%s", (coding["attempt_id"],)).fetchone()
+            self.assertEqual(run_row, {"status": "cancelled", "current_candidate_id": None})
+            self.assertIsNotNone(candidate)
+        self.assertEqual(self.worker.journal.db.execute("SELECT state FROM attempts WHERE id=?",
+                         (coding["attempt_id"],)).fetchone()[0], "done")
+
+        path = self.propose()
+        self.claim_and_execute()
+        review = self.worker.api.call("POST", "/worker/claim", {"worker_id": "worker",
+            "capabilities": ["code", "check", "bundle", "review"]})["assignment"]
+        self.assertTrue(self.worker.journal.accept(review))
+        with patch.object(self.worker, "send_result", side_effect=WorkerError("ack lost")):
+            self.worker.execute(review)
+        self.assertEqual(self.browser("POST", path + "/cancel", {})[0], 303)
+        self.restart_worker()
+        self.worker.reconcile()
+        with connect(self.dsn) as conn:
+            state = conn.execute("SELECT status FROM runs WHERE id=%s", (path.split("/")[-1],)).fetchone()["status"]
+            evidence = conn.execute("SELECT disposition,result FROM reviews WHERE attempt_id=%s",
+                                    (review["attempt_id"],)).fetchone()
+            self.assertEqual(state, "cancelled")
+            self.assertEqual((evidence["disposition"], evidence["result"]["verdict"]), ("stale", "pass"))
+
+    def test_current_bundle_retrieval_revokes_readiness_on_corruption_or_loss(self):
+        for missing in (False, True):
+            path = self.propose(revisions=0)
+            self.claim_and_execute()
+            self.claim_and_execute()
+            with connect(self.dsn) as conn:
+                run_row = conn.execute("SELECT id,current_candidate_id FROM runs WHERE id=%s",
+                                       (path.split("/")[-1],)).fetchone()
+                candidate = conn.execute("SELECT artifact_sha256 FROM candidates WHERE id=%s",
+                                         (run_row["current_candidate_id"],)).fetchone()
+            bundle = self.root / "artifacts" / (candidate["artifact_sha256"] + ".bundle")
+            if missing:
+                bundle.unlink()
+                self.assertEqual(self.browser("GET", f"/candidates/{run_row['current_candidate_id']}/bundle")[0], 500)
+            else:
+                bundle.write_bytes(b"corrupt")
+                with self.assertRaises(WorkerError):
+                    self.worker.api.call("GET", "/worker/bundle/" + str(run_row["current_candidate_id"]))
+            with connect(self.dsn) as conn:
+                state = conn.execute("SELECT status,stop_reason FROM runs WHERE id=%s", (run_row["id"],)).fetchone()
+                stopped = conn.execute("SELECT count(*) FROM events WHERE run_id=%s AND kind='run_stopped'",
+                                       (run_row["id"],)).fetchone()["count"]
+                self.assertEqual(state, {"status": "blocked", "stop_reason": "integrity_failure"})
+                self.assertEqual(stopped, 1)
+
+    def test_deadline_reconnect_preserves_late_candidate_and_review(self):
+        from teem.common import digest
+
+        path = self.propose()
+        coding = self.worker.api.call("POST", "/worker/claim", {"worker_id": "worker",
+            "capabilities": ["code", "check", "bundle", "review"]})["assignment"]
+        self.assertTrue(self.worker.journal.accept(coding))
+        with patch.object(self.worker, "send_result", side_effect=WorkerError("connection lost")):
+            self.worker.execute(coding)
+        with connect(self.dsn) as conn:
+            conn.execute("UPDATE runs SET deadline=now()-interval '1 second' WHERE id=%s", (path.split("/")[-1],))
+        self.restart_worker()
+        original_call = self.worker.api.call
+
+        def reject_report(method, endpoint, data=None, sha=None):
+            if endpoint.startswith("/worker/report/"):
+                raise WorkerError("evidence persistence failed")
+            return original_call(method, endpoint, data, sha)
+
+        with patch.object(self.worker.api, "call", side_effect=reject_report):
+            self.worker.reconcile()
+        self.assertEqual(self.worker.journal.db.execute("SELECT state FROM attempts WHERE id=?",
+                         (coding["attempt_id"],)).fetchone()[0], "ready_to_report")
+        candidate_report = json.loads(self.worker.journal.db.execute("SELECT result FROM attempts WHERE id=?",
+                                           (coding["attempt_id"],)).fetchone()[0])
+        self.worker.reconcile()
+        with connect(self.dsn) as conn:
+            run_row = conn.execute("SELECT status,stop_reason,current_candidate_id FROM runs WHERE id=%s",
+                                   (path.split("/")[-1],)).fetchone()
+            candidate = conn.execute("SELECT * FROM candidates WHERE attempt_id=%s", (coding["attempt_id"],)).fetchone()
+            attempt = conn.execute("SELECT status,result_sha256 FROM attempts WHERE id=%s", (coding["attempt_id"],)).fetchone()
+            self.assertEqual(run_row, {"status": "blocked", "stop_reason": "deadline", "current_candidate_id": None})
+            self.assertIsNotNone(candidate)
+            self.assertEqual(attempt, {"status": "candidate", "result_sha256": digest({k: v for k, v in candidate_report.items()
+                                                                                         if k != "bundle"})})
+            self.assertEqual(conn.execute("SELECT count(*) FROM tasks WHERE run_id=%s", (path.split("/")[-1],)).fetchone()["count"], 1)
+
+        self.reviewer_verdict("changes_required")
+        path = self.propose()
+        self.claim_and_execute()
+        review = self.worker.api.call("POST", "/worker/claim", {"worker_id": "worker",
+            "capabilities": ["code", "check", "bundle", "review"]})["assignment"]
+        self.assertTrue(self.worker.journal.accept(review))
+        with patch.object(self.worker, "send_result", side_effect=WorkerError("connection lost")):
+            self.worker.execute(review)
+        with connect(self.dsn) as conn:
+            current = conn.execute("SELECT current_candidate_id FROM runs WHERE id=%s", (path.split("/")[-1],)).fetchone()["current_candidate_id"]
+            conn.execute("UPDATE runs SET deadline=now()-interval '1 second' WHERE id=%s", (path.split("/")[-1],))
+        self.restart_worker()
+        self.worker.reconcile()
+        review_report = json.loads(self.worker.journal.db.execute("SELECT result FROM attempts WHERE id=?",
+                                         (review["attempt_id"],)).fetchone()[0])
+        with connect(self.dsn) as conn:
+            run_row = conn.execute("SELECT status,stop_reason,current_candidate_id FROM runs WHERE id=%s",
+                                   (path.split("/")[-1],)).fetchone()
+            evidence = conn.execute("SELECT disposition,result FROM reviews WHERE attempt_id=%s", (review["attempt_id"],)).fetchone()
+            attempt = conn.execute("SELECT status,result_sha256 FROM attempts WHERE id=%s", (review["attempt_id"],)).fetchone()
+            self.assertEqual(run_row, {"status": "blocked", "stop_reason": "deadline", "current_candidate_id": current})
+            self.assertEqual((evidence["disposition"], evidence["result"]["verdict"]), ("stale", "changes_required"))
+            self.assertEqual(attempt, {"status": "review", "result_sha256": digest(review_report)})
+            self.assertEqual(conn.execute("SELECT count(*) FROM tasks WHERE run_id=%s", (path.split("/")[-1],)).fetchone()["count"], 2)
+        self.assertEqual(self.worker.journal.db.execute("SELECT state FROM attempts WHERE id=?",
+                         (review["attempt_id"],)).fetchone()[0], "done")
+
+    def assert_superseded_journal_evidence(self, kind):
+        from teem.common import digest
+
+        path = self.propose()
+        if kind == "review":
+            self.claim_and_execute()
+        assignment = self.worker.api.call("POST", "/worker/claim", {"worker_id": "worker",
+            "capabilities": ["code", "check", "bundle", "review"]})["assignment"]
+        self.assertEqual(assignment["kind"], kind)
+        self.assertTrue(self.worker.journal.accept(assignment))
+        with patch.object(self.worker, "send_result", side_effect=WorkerError("connection lost")):
+            self.worker.execute(assignment)
+        report = json.loads(self.worker.journal.db.execute("SELECT result FROM attempts WHERE id=?",
+                                                     (assignment["attempt_id"],)).fetchone()[0])
+        self.worker.api.call("POST", "/worker/reconcile/" + assignment["attempt_id"],
+                             {"generation": assignment["generation"], "journal_state": "executing", "outcome": None})
+        self.assertEqual(self.browser("POST", path + "/retry", {})[0], 303)
+        replacement = self.worker.api.call("POST", "/worker/claim", {"worker_id": "worker",
+            "capabilities": ["code", "check", "bundle", "review"]})["assignment"]
+        self.assertEqual(replacement["generation"], 2)
+        original_call = self.worker.api.call
+
+        def reject_report(method, endpoint, data=None, sha=None):
+            if endpoint.startswith("/worker/report/"):
+                raise WorkerError("persistence unavailable")
+            return original_call(method, endpoint, data, sha)
+
+        with patch.object(self.worker.api, "call", side_effect=reject_report):
+            self.worker.reconcile()
+        self.assertEqual(self.worker.journal.db.execute("SELECT state FROM attempts WHERE id=?",
+                         (assignment["attempt_id"],)).fetchone()[0], "ready_to_report")
+        self.worker.reconcile()
+        self.assertEqual(self.worker.journal.db.execute("SELECT state FROM attempts WHERE id=?",
+                         (assignment["attempt_id"],)).fetchone()[0], "done")
+        with connect(self.dsn) as conn:
+            run_row = conn.execute("SELECT status,current_candidate_id FROM runs WHERE id=%s",
+                                   (path.split("/")[-1],)).fetchone()
+            attempt = conn.execute("SELECT result_sha256 FROM attempts WHERE id=%s",
+                                   (assignment["attempt_id"],)).fetchone()
+            self.assertEqual(attempt["result_sha256"], digest({k: v for k, v in report.items() if k != "bundle"}))
+            self.assertIsNotNone(conn.execute("""SELECT 1 FROM events WHERE run_id=%s AND kind='stale_report'
+                                                 AND payload->>'attempt_id'=%s""",
+                                              (path.split("/")[-1], assignment["attempt_id"])).fetchone())
+            self.assertEqual(run_row["status"], "coding" if kind == "code_and_check" else "reviewing")
+            self.assertEqual(conn.execute("SELECT count(*) FROM tasks WHERE run_id=%s",
+                                          (path.split("/")[-1],)).fetchone()["count"], 1 if kind == "code_and_check" else 2)
+            if kind == "code_and_check":
+                self.assertIsNone(run_row["current_candidate_id"])
+                self.assertIsNotNone(conn.execute("SELECT id FROM candidates WHERE attempt_id=%s",
+                                                  (assignment["attempt_id"],)).fetchone())
+            else:
+                evidence = conn.execute("SELECT disposition,result FROM reviews WHERE attempt_id=%s",
+                                        (assignment["attempt_id"],)).fetchone()
+                self.assertEqual((evidence["disposition"], evidence["result"]["verdict"]), ("stale", "pass"))
+        self.assertEqual(self.browser("POST", path + "/cancel", {})[0], 303)
+        self.worker.api.call("POST", "/worker/report/" + replacement["attempt_id"],
+                             {"generation": replacement["generation"], "outcome": "cancelled"})
+
+    def test_superseded_candidate_journal_is_preserved(self):
+        self.assert_superseded_journal_evidence("code_and_check")
+
+    def test_superseded_review_journal_is_preserved(self):
+        self.assert_superseded_journal_evidence("review")
+
+    def test_changes_required_revision_uses_parent_bundle_and_fresh_review(self):
+        (self.repo / "coder.py").write_text(
+            "import json\nfrom pathlib import Path\n"
+            "contract=json.loads(Path('/contract.json').read_text())\n"
+            "if contract.get('parent_candidate_id'):\n"
+            "    assert contract['accepted_review']['verdict']=='changes_required'\n"
+            "    assert contract['parent_check_evidence']['checks'][0]['exit_code']==0\n"
+            "Path('value.txt').write_text('after revised\\n' if contract.get('parent_candidate_id') else 'after\\n')\n")
+        (self.repo / "check.py").write_text(
+            "from pathlib import Path\nassert Path('value.txt').read_text().startswith('after')\n")
+        run("git", "add", ".", cwd=self.repo)
+        run("git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "review fixture", cwd=self.repo)
+        base = run("git", "rev-parse", "HEAD", cwd=self.repo)
+        with connect(self.dsn) as conn:
+            conn.execute("UPDATE projects SET base_commit=%s WHERE id=%s", (base, self.project_id))
+        self.reviewer.write_text(
+            "#!/usr/bin/python3\nimport json\n"
+            "from pathlib import Path\n"
+            "context=json.loads(Path('/context.json').read_text())\n"
+            "pack=context['pack']\n"
+            "assert 'accepted_review' not in context and 'source_review' not in context\n"
+            "assert not Path('/workspace').exists()\n"
+            "try: Path('/context.json').write_text('changed')\n"
+            "except OSError: pass\n"
+            "else: raise AssertionError('review input writable')\n"
+            "value=pack['sources']['value.txt']['lines'][0]\n"
+            "needs_change=value=='after'\n"
+            "finding={'criterion':pack['acceptance_criteria'],'description':'Use reviewed value',"
+            "'evidence':[{'kind':'source','path':'value.txt','start_line':1,'end_line':1}]}\n"
+            "print(json.dumps({'candidate_id':pack['candidate_id'],"
+            "'contract_version':pack['contract_version'],'context_sha256':context['sha256'],"
+            "'verdict':'changes_required' if needs_change else 'pass',"
+            "'summary':'Needs revision' if needs_change else 'Criteria met',"
+            "'findings':[finding] if needs_change else [],'uncertainties':[]}))\n")
+        self.reviewer.chmod(0o755)
+        path = self.propose(revisions=1)
+        first_code = self.claim_and_execute()
+        first_review = self.claim_and_execute()
+        self.assertIn(b"queued", self.browser("GET", path)[2])
+        self.stop_server()
+        self.start_server()
+        self.worker.api.url = self.url
+        revision = self.claim_and_execute()
+        self.assertEqual(revision["revision_number"], 1)
+        self.assertEqual(revision["input_candidate_id"], first_review["input_candidate_id"])
+        self.assertEqual(revision["source_review_attempt_id"], first_review["attempt_id"])
+        second_review = self.claim_and_execute()
+        self.assertNotEqual(second_review["review_context"]["sha256"], first_review["review_context"]["sha256"])
+        self.assertIn(b"Ready to merge", self.browser("GET", path)[2])
+        with connect(self.dsn) as conn:
+            candidates = conn.execute("SELECT * FROM candidates WHERE run_id=%s ORDER BY created_at", (path.split("/")[-1],)).fetchall()
+            reviews = conn.execute("""SELECT v.* FROM reviews v JOIN attempts a ON a.id=v.attempt_id
+                                      JOIN tasks t ON t.id=a.task_id WHERE t.run_id=%s ORDER BY v.created_at""",
+                                   (path.split("/")[-1],)).fetchall()
+            self.assertEqual([r["result"]["verdict"] for r in reviews], ["changes_required", "pass"])
+            self.assertEqual(len(candidates), 2)
+            self.assertNotEqual(candidates[0]["artifact_sha256"], candidates[1]["artifact_sha256"])
+            current = conn.execute("SELECT current_candidate_id FROM runs WHERE id=%s", (path.split("/")[-1],)).fetchone()
+            self.assertEqual(current["current_candidate_id"], candidates[1]["id"])
+        for assignment, expected in ((first_code, "ready_to_merge"), (revision, "blocked")):
+            report = json.loads(self.worker.journal.db.execute("SELECT result FROM attempts WHERE id=?",
+                                                         (assignment["attempt_id"],)).fetchone()[0])
+            report["usage"]["conflict"] = True
+            with self.assertRaises(WorkerError):
+                self.worker.api.call("POST", "/worker/report/" + assignment["attempt_id"],
+                                     {key: value for key, value in report.items() if key != "bundle"})
+            with connect(self.dsn) as conn:
+                self.assertEqual(conn.execute("SELECT status FROM runs WHERE id=%s",
+                                              (path.split("/")[-1],)).fetchone()["status"], expected)
+                self.assertEqual(conn.execute("""SELECT count(*) FROM events WHERE run_id=%s AND kind='conflicting_report'""",
+                                              (path.split("/")[-1],)).fetchone()["count"],
+                                 1 if expected == "ready_to_merge" else 2)
+
+    def test_invalid_review_retries_once_then_fails(self):
+        self.reviewer.write_text("#!/usr/bin/python3\nprint('not JSON')\n")
+        self.reviewer.chmod(0o755)
+        path = self.propose()
+        self.claim_and_execute()
+        first = self.claim_and_execute()
+        second = self.claim_and_execute()
+        self.assertEqual(first["task_id"], second["task_id"])
+        self.assertEqual(second["generation"], first["generation"] + 1)
+        with connect(self.dsn) as conn:
+            evidence = conn.execute("""SELECT disposition,validation_error FROM reviews
+                                       WHERE attempt_id IN (%s,%s) ORDER BY created_at""",
+                                    (first["attempt_id"], second["attempt_id"])).fetchall()
+            self.assertEqual([x["disposition"] for x in evidence], ["invalid", "invalid"])
+        self.assertIn(b"failed", self.browser("GET", path)[2])
+        self.assertIsNone(self.worker.api.call("POST", "/worker/claim", {"worker_id": "worker",
+            "capabilities": ["code", "check", "bundle", "review"]})["assignment"])
+
+    def test_wrong_review_identity_is_invalid_and_cannot_complete(self):
+        path = self.propose()
+        self.claim_and_execute()
+        review = self.worker.api.call("POST", "/worker/claim", {"worker_id": "worker",
+            "capabilities": ["code", "check", "bundle", "review"]})["assignment"]
+        pack = review["review_context"]["pack"]
+        report = {"outcome": "review", "generation": review["generation"],
+                  "raw_output": json.dumps({"candidate_id": "00000000-0000-0000-0000-000000000000",
+                                            "contract_version": pack["contract_version"],
+                                            "context_sha256": review["review_context"]["sha256"],
+                                            "verdict": "pass", "summary": "Wrong candidate",
+                                            "findings": [], "uncertainties": []}),
+                  "provenance": {"runner_identity": review["contract"]["reviewer"]["identity"],
+                                 "instructions_sha256": review["contract"]["reviewer"]["instructions_sha256"],
+                                 "context_sha256": review["review_context"]["sha256"],
+                                 "started_at": "2026-01-01T00:00:00Z", "ended_at": "2026-01-01T00:00:01Z"}}
+        self.assertEqual(self.worker.api.call("POST", "/worker/report/" + review["attempt_id"], report)["status"],
+                         "awaiting_review")
+        with connect(self.dsn) as conn:
+            evidence = conn.execute("SELECT disposition,result FROM reviews WHERE attempt_id=%s",
+                                    (review["attempt_id"],)).fetchone()
+            self.assertEqual((evidence["disposition"], evidence["result"]), ("invalid", None))
+            self.assertNotEqual(conn.execute("SELECT status FROM runs WHERE id=%s",
+                                             (path.split("/")[-1],)).fetchone()["status"], "ready_to_merge")
+        replacement = self.claim_and_execute()
+        self.assertEqual(replacement["task_id"], review["task_id"])
+        self.assertIn(b"Ready to merge", self.browser("GET", path)[2])
+
+    @unittest.skipUnless(os.environ.get("TEEM_OLLAMA_SMOKE_MODEL"), "set TEEM_OLLAMA_SMOKE_MODEL for real local reviewer")
+    def test_real_ollama_review_smoke(self):
+        model = os.environ["TEEM_OLLAMA_SMOKE_MODEL"]
+        installed = self.root / "installed-ollama-reviewer"
+        shutil.copy2(Path(__file__).parents[1] / "teem" / "reviewer_ollama.py", installed)
+        installed.chmod(0o755)
+        self.reviewer_config.update({"identity": "local-ollama/" + model, "destination": "local-ollama",
+                                     "model": model, "timeout": 600})
+        self.reviewer_file.write_text(json.dumps(self.reviewer_config))
+        self.server.app.reviewer = self.reviewer_config
+        self.worker.projects[self.project_id]["reviewer"].update(
+            {"identity": self.reviewer_config["identity"], "destination": "local-ollama",
+             "model": model, "timeout": 600, "executable": str(installed)})
+        status, headers, _ = self.browser("POST", "/requests", {"project": self.project_id,
+            "objective": "Set value.txt to after", "criteria": "value.txt contains exactly after followed by a newline",
+            "revisions": "0"})
+        self.assertEqual(status, 303)
+        path = headers["Location"]
+        self.assertEqual(self.browser("POST", path + "/approve", {"version": "1", "decision": "approve"})[0], 303)
+        self.claim_and_execute()
+        review = self.claim_and_execute()
+        with connect(self.dsn) as conn:
+            evidence = conn.execute("SELECT disposition,result,validation_error FROM reviews WHERE attempt_id=%s",
+                                    (review["attempt_id"],)).fetchone()
+            self.assertEqual(evidence["disposition"], "accepted", evidence["validation_error"])
+            self.assertIn(evidence["result"]["verdict"], ("pass", "changes_required", "blocked"))
+
+    def test_review_input_overflow_blocks_without_dispatch(self):
+        (self.repo / "large.txt").write_text("x" * (2 * 1024 * 1024 + 1))
+        run("git", "add", "large.txt", cwd=self.repo)
+        run("git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "large base", cwd=self.repo)
+        with connect(self.dsn) as conn:
+            conn.execute("UPDATE projects SET base_commit=%s WHERE id=%s",
+                         (run("git", "rev-parse", "HEAD", cwd=self.repo), self.project_id))
+        path = self.propose()
+        self.claim_and_execute()
+        self.assertIsNone(self.worker.api.call("POST", "/worker/claim", {"worker_id": "worker",
+            "capabilities": ["code", "check", "bundle", "review"]})["assignment"])
+        self.assertIn(b"review_input_unavailable", self.browser("GET", path)[2])
+
+    def test_blocked_review_and_revision_cap_preserve_evidence(self):
+        self.reviewer_verdict("blocked")
+        path = self.propose()
+        self.claim_and_execute()
+        review = self.claim_and_execute()
+        with connect(self.dsn) as conn:
+            state = conn.execute("SELECT status,stop_reason FROM runs WHERE id=%s", (path.split("/")[-1],)).fetchone()
+            result = conn.execute("SELECT disposition,result FROM reviews WHERE attempt_id=%s",
+                                  (review["attempt_id"],)).fetchone()
+            self.assertEqual(state, {"status": "blocked", "stop_reason": "review_uncertain"})
+            self.assertEqual(result["result"]["verdict"], "blocked")
+            self.assertEqual(result["disposition"], "accepted")
+        self.reviewer_verdict("changes_required")
+        (self.repo / "coder.py").write_text(
+            "import json\nfrom pathlib import Path\n"
+            "contract=json.loads(Path('/contract.json').read_text())\n"
+            "Path('value.txt').write_text('after revised\\n' if contract.get('parent_candidate_id') else 'after\\n')\n")
+        (self.repo / "check.py").write_text("from pathlib import Path\nassert Path('value.txt').read_text().startswith('after')\n")
+        run("git", "add", ".", cwd=self.repo)
+        run("git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "revision fixture", cwd=self.repo)
+        with connect(self.dsn) as conn:
+            conn.execute("UPDATE projects SET base_commit=%s WHERE id=%s",
+                         (run("git", "rev-parse", "HEAD", cwd=self.repo), self.project_id))
+        capped = self.propose(revisions=1)
+        for _ in range(4):
+            self.claim_and_execute()
+        with connect(self.dsn) as conn:
+            state = conn.execute("SELECT status,stop_reason,current_candidate_id FROM runs WHERE id=%s",
+                                 (capped.split("/")[-1],)).fetchone()
+            self.assertEqual((state["status"], state["stop_reason"]), ("blocked", "revision_limit"))
+            self.assertEqual(conn.execute("SELECT count(*) FROM candidates WHERE run_id=%s",
+                                          (capped.split("/")[-1],)).fetchone()["count"], 2)
+            self.assertEqual(conn.execute("""SELECT count(*) FROM reviews v JOIN attempts a ON a.id=v.attempt_id
+                                             JOIN tasks t ON t.id=a.task_id WHERE t.run_id=%s AND v.disposition='accepted'""",
+                                          (capped.split("/")[-1],)).fetchone()["count"], 2)
+            self.assertEqual(conn.execute("SELECT count(*) FROM tasks WHERE run_id=%s AND status='queued'",
+                                          (capped.split("/")[-1],)).fetchone()["count"], 0)
+
+    def test_review_isolation_upload_rejection_and_bundle_tampering(self):
+        self.reviewer.write_text(
+            "#!/usr/bin/python3\nimport json,socket\nfrom pathlib import Path\n"
+            "context=json.loads(Path('/context.json').read_text())\npack=context['pack']\n"
+            "assert not Path('/workspace').exists()\n"
+            "assert not Path('/secret-worker-token').exists()\n"
+            "try: Path('/context.json').write_text('changed')\n"
+            "except OSError: pass\n"
+            "else: raise AssertionError('writable context')\n"
+            "try: socket.create_connection(('127.0.0.1', 55434), timeout=1)\n"
+            "except OSError: pass\n"
+            "else: raise AssertionError('network available')\n"
+            "print(json.dumps({'candidate_id':pack['candidate_id'],"
+            "'contract_version':pack['contract_version'],'context_sha256':context['sha256'],"
+            "'verdict':'pass','summary':'Isolated review','findings':[],'uncertainties':[]}))\n")
+        self.reviewer.chmod(0o755)
+        path = self.propose()
+        coding = self.claim_and_execute()
+        review = self.worker.api.call("POST", "/worker/claim", {"worker_id": "worker",
+            "capabilities": ["code", "check", "bundle", "review"]})["assignment"]
+        with self.assertRaises(WorkerError):
+            self.worker.api.call("POST", "/worker/upload/" + review["attempt_id"], b"x",
+                                 hashlib.sha256(b"x").hexdigest())
+        self.assertTrue(self.worker.journal.accept(review))
+        self.worker.execute(review)
+        with connect(self.dsn) as conn:
+            candidate = conn.execute("SELECT * FROM candidates WHERE attempt_id=%s", (coding["attempt_id"],)).fetchone()
+            self.assertEqual(conn.execute("SELECT status FROM runs WHERE id=%s", (path.split("/")[-1],)).fetchone()["status"],
+                             "ready_to_merge")
+        bundle = self.root / "artifacts" / (candidate["artifact_sha256"] + ".bundle")
+        bundle.write_bytes(b"corrupt")
+        self.assertEqual(self.browser("GET", f"/candidates/{candidate['id']}/bundle")[0], 500)
+        with connect(self.dsn) as conn:
+            self.assertEqual(conn.execute("SELECT status,stop_reason FROM runs WHERE id=%s", (path.split("/")[-1],)).fetchone(),
+                             {"status": "blocked", "stop_reason": "integrity_failure"})
+
+    def test_review_lease_reconciliation_precedes_retry_and_deadline_blocks(self):
+        path = self.propose()
+        self.claim_and_execute()
+        review = self.worker.api.call("POST", "/worker/claim", {"worker_id": "worker",
+            "capabilities": ["code", "check", "bundle", "review"]})["assignment"]
+        self.assertTrue(self.worker.journal.accept(review))
+        with connect(self.dsn) as conn:
+            conn.execute("UPDATE attempts SET lease_until=now()-interval '1 second' WHERE id=%s", (review["attempt_id"],))
+        self.assertIsNone(self.worker.api.call("POST", "/worker/claim", {"worker_id": "worker",
+            "capabilities": ["code", "check", "bundle", "review"]})["assignment"])
+        self.assertEqual(self.browser("POST", path + "/retry", {})[0], 409)
+        self.restart_worker()
+        self.worker.reconcile()
+        self.assertEqual(self.browser("POST", path + "/retry", {})[0], 303)
+        replacement = self.worker.api.call("POST", "/worker/claim", {"worker_id": "worker",
+            "capabilities": ["code", "check", "bundle", "review"]})["assignment"]
+        self.assertEqual(replacement["task_id"], review["task_id"])
+        self.assertEqual(replacement["generation"], 2)
+        pack = review["review_context"]["pack"]
+        old_result = {"outcome": "review", "generation": review["generation"],
+            "raw_output": json.dumps({"candidate_id": pack["candidate_id"],
+                                      "contract_version": pack["contract_version"],
+                                      "context_sha256": review["review_context"]["sha256"],
+                                      "verdict": "pass", "summary": "Old judgment", "findings": [], "uncertainties": []}),
+            "provenance": {"runner_identity": review["contract"]["reviewer"]["identity"],
+                           "instructions_sha256": review["contract"]["reviewer"]["instructions_sha256"],
+                           "context_sha256": review["review_context"]["sha256"],
+                           "started_at": "2026-01-01T00:00:00Z", "ended_at": "2026-01-01T00:00:01Z"}}
+        self.assertEqual(self.worker.api.call("POST", "/worker/report/" + review["attempt_id"],
+                                              old_result)["status"], "stale")
+        with connect(self.dsn) as conn:
+            self.assertEqual(conn.execute("SELECT disposition FROM reviews WHERE attempt_id=%s",
+                                          (review["attempt_id"],)).fetchone()["disposition"], "stale")
+            self.assertNotEqual(conn.execute("SELECT status FROM runs WHERE id=%s",
+                                             (path.split("/")[-1],)).fetchone()["status"], "ready_to_merge")
+        with self.assertRaises(WorkerError):
+            self.worker.api.call("POST", "/worker/report/" + review["attempt_id"],
+                                 {"generation": review["generation"], "outcome": "failed"})
+        self.assertTrue(self.worker.journal.accept(replacement))
+        self.worker.execute(replacement)
+        self.assertIn(b"Ready to merge", self.browser("GET", path)[2])
+        other = self.propose()
+        self.claim_and_execute()
+        self.stop_server()
+        with connect(self.dsn) as conn:
+            conn.execute("UPDATE runs SET deadline=now()-interval '1 second' WHERE id=%s", (other.split("/")[-1],))
+        self.start_server()
+        self.worker.api.url = self.url
+        self.assertIsNone(self.worker.api.call("POST", "/worker/claim", {"worker_id": "worker",
+            "capabilities": ["code", "check", "bundle", "review"]})["assignment"])
+        self.assertIn(b"deadline", self.browser("GET", other)[2])
+
+    def test_review_timeout_retries_once(self):
+        self.reviewer_config["timeout"] = 1
+        self.reviewer_file.write_text(json.dumps(self.reviewer_config))
+        self.server.app.reviewer = self.reviewer_config
+        self.worker.projects[self.project_id]["reviewer"]["timeout"] = 1
+        self.reviewer.write_text("#!/usr/bin/python3\nimport time\ntime.sleep(10)\n")
+        self.reviewer.chmod(0o755)
+        path = self.propose()
+        self.claim_and_execute()
+        first = self.claim_and_execute()
+        second = self.claim_and_execute()
+        self.assertEqual(first["task_id"], second["task_id"])
+        with connect(self.dsn) as conn:
+            self.assertEqual(conn.execute("SELECT status FROM runs WHERE id=%s",
+                                          (path.split("/")[-1],)).fetchone()["status"], "failed")
+            rows = conn.execute("SELECT validation_error FROM reviews WHERE attempt_id IN (%s,%s)",
+                                (first["attempt_id"], second["attempt_id"])).fetchall()
+            self.assertEqual(len(rows), 2)
+            self.assertTrue(all("reviewer exited" in row["validation_error"] for row in rows))
+
+    def test_failed_revision_keeps_parent_current(self):
+        (self.repo / "coder.py").write_text(
+            "import json,sys\nfrom pathlib import Path\n"
+            "contract=json.loads(Path('/contract.json').read_text())\n"
+            "if contract.get('parent_candidate_id'): sys.exit(1)\n"
+            "Path('value.txt').write_text('after\\n')\n")
+        run("git", "add", "coder.py", cwd=self.repo)
+        run("git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "failed revision fixture", cwd=self.repo)
+        with connect(self.dsn) as conn:
+            conn.execute("UPDATE projects SET base_commit=%s WHERE id=%s",
+                         (run("git", "rev-parse", "HEAD", cwd=self.repo), self.project_id))
+        self.reviewer_verdict("changes_required")
+        path = self.propose()
+        first = self.claim_and_execute()
+        self.claim_and_execute()
+        failed_one = self.claim_and_execute()
+        failed_two = self.claim_and_execute()
+        self.assertEqual(failed_one["task_id"], failed_two["task_id"])
+        with connect(self.dsn) as conn:
+            state = conn.execute("SELECT status,current_candidate_id FROM runs WHERE id=%s",
+                                 (path.split("/")[-1],)).fetchone()
+            parent = conn.execute("SELECT id FROM candidates WHERE attempt_id=%s", (first["attempt_id"],)).fetchone()
+            self.assertEqual(state["status"], "failed")
+            self.assertEqual(state["current_candidate_id"], parent["id"])
+            self.assertEqual(conn.execute("SELECT count(*) FROM candidates WHERE run_id=%s",
+                                          (path.split("/")[-1],)).fetchone()["count"], 1)
+
+    def test_revision_failed_checks_preserve_new_candidate_without_review(self):
+        (self.repo / "coder.py").write_text(
+            "import json\nfrom pathlib import Path\n"
+            "contract=json.loads(Path('/contract.json').read_text())\n"
+            "Path('value.txt').write_text('bad\\n' if contract.get('parent_candidate_id') else 'after\\n')\n")
+        run("git", "add", "coder.py", cwd=self.repo)
+        run("git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "failed check revision", cwd=self.repo)
+        with connect(self.dsn) as conn:
+            conn.execute("UPDATE projects SET base_commit=%s WHERE id=%s",
+                         (run("git", "rev-parse", "HEAD", cwd=self.repo), self.project_id))
+        self.reviewer_verdict("changes_required")
+        path = self.propose()
+        self.claim_and_execute()
+        self.claim_and_execute()
+        revision = self.claim_and_execute()
+        self.assertEqual(revision["revision_number"], 1)
+        with connect(self.dsn) as conn:
+            run_row = conn.execute("SELECT status,current_candidate_id FROM runs WHERE id=%s",
+                                   (path.split("/")[-1],)).fetchone()
+            candidate = conn.execute("SELECT * FROM candidates WHERE id=%s", (run_row["current_candidate_id"],)).fetchone()
+            self.assertEqual(run_row["status"], "checks_failed")
+            self.assertNotEqual(candidate["evidence"]["checks"][0]["exit_code"], 0)
+            self.assertEqual(conn.execute("SELECT count(*) FROM tasks WHERE run_id=%s AND kind='review'",
+                                          (path.split("/")[-1],)).fetchone()["count"], 1)
+
+    def test_attempt_cap_across_roles_blocks_next_revision(self):
+        (self.repo / "coder.py").write_text(
+            "import json\nfrom pathlib import Path\n"
+            "contract=json.loads(Path('/contract.json').read_text())\n"
+            "Path('value.txt').write_text('after revised\\n' if contract.get('parent_candidate_id') else 'after\\n')\n")
+        (self.repo / "check.py").write_text("from pathlib import Path\nassert Path('value.txt').read_text().startswith('after')\n")
+        run("git", "add", ".", cwd=self.repo)
+        run("git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "attempt cap fixture", cwd=self.repo)
+        with connect(self.dsn) as conn:
+            conn.execute("UPDATE projects SET base_commit=%s WHERE id=%s",
+                         (run("git", "rev-parse", "HEAD", cwd=self.repo), self.project_id))
+        self.reviewer_verdict("changes_required")
+        path = self.propose(revisions=2)
+
+        def fail_attempt():
+            attempt = self.worker.api.call("POST", "/worker/claim", {"worker_id": "worker",
+                "capabilities": ["code", "check", "bundle", "review"]})["assignment"]
+            self.assertIsNotNone(attempt)
+            self.worker.api.call("POST", "/worker/report/" + attempt["attempt_id"],
+                                 {"generation": attempt["generation"], "outcome": "failed",
+                                  "usage": {"error": "isolated execution failed"}})
+            return attempt
+
+        fail_attempt()
+        self.claim_and_execute()
+        fail_attempt()
+        self.claim_and_execute()
+        fail_attempt()
+        self.claim_and_execute()
+        fail_attempt()
+        last = self.claim_and_execute()
+        self.assertEqual(last["kind"], "review")
+        with connect(self.dsn) as conn:
+            run_row = conn.execute("SELECT status,stop_reason FROM runs WHERE id=%s", (path.split("/")[-1],)).fetchone()
+            self.assertEqual(run_row, {"status": "blocked", "stop_reason": "attempt_limit"})
+            self.assertEqual(conn.execute("""SELECT count(*) FROM attempts a JOIN tasks t ON t.id=a.task_id
+                                             WHERE t.run_id=%s""", (path.split("/")[-1],)).fetchone()["count"], 8)
+            self.assertEqual(conn.execute("SELECT count(*) FROM tasks WHERE run_id=%s AND revision_number=2",
+                                          (path.split("/")[-1],)).fetchone()["count"], 0)
+
+    def test_cancellation_before_review_result_prevents_revision(self):
+        self.reviewer_verdict("changes_required")
+        path = self.propose()
+        self.claim_and_execute()
+        review = self.worker.api.call("POST", "/worker/claim", {"worker_id": "worker",
+            "capabilities": ["code", "check", "bundle", "review"]})["assignment"]
+        self.assertEqual(self.browser("POST", path + "/cancel", {})[0], 303)
+        with connect(self.dsn) as conn:
+            self.assertEqual(conn.execute("SELECT status FROM runs WHERE id=%s",
+                                          (path.split("/")[-1],)).fetchone()["status"], "cancelling")
+        self.assertEqual(self.browser("POST", "/requests", {"project": self.project_id,
+            "objective": "Another", "criteria": "Another"})[0], 409)
+        pack = review["review_context"]["pack"]
+        report = {"outcome": "review", "generation": review["generation"],
+                  "raw_output": json.dumps({"candidate_id": pack["candidate_id"],
+                                            "contract_version": pack["contract_version"],
+                                            "context_sha256": review["review_context"]["sha256"],
+                                            "verdict": "changes_required", "summary": "Needs change",
+                                            "findings": [{"criterion": pack["acceptance_criteria"],
+                                                          "description": "Change value",
+                                                          "evidence": [{"kind": "source", "path": "value.txt",
+                                                                        "start_line": 1, "end_line": 1}]}],
+                                            "uncertainties": []}),
+                  "provenance": {"runner_identity": review["contract"]["reviewer"]["identity"],
+                                 "instructions_sha256": review["contract"]["reviewer"]["instructions_sha256"],
+                                 "context_sha256": review["review_context"]["sha256"],
+                                 "started_at": "2026-01-01T00:00:00Z", "ended_at": "2026-01-01T00:00:01Z"}}
+        self.assertEqual(self.worker.api.call("POST", "/worker/report/" + review["attempt_id"], report)["status"],
+                         "cancelled")
+        with connect(self.dsn) as conn:
+            self.assertEqual(conn.execute("SELECT disposition FROM reviews WHERE attempt_id=%s",
+                                          (review["attempt_id"],)).fetchone()["disposition"], "stale")
+            self.assertEqual(conn.execute("SELECT count(*) FROM tasks WHERE run_id=%s AND revision_number=1",
+                                          (path.split("/")[-1],)).fetchone()["count"], 0)
 
 
 if __name__ == "__main__":

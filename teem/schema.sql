@@ -22,13 +22,15 @@ CREATE TABLE IF NOT EXISTS runs (
     project_id text NOT NULL REFERENCES projects(id),
     status text NOT NULL,
     contract_version integer NOT NULL DEFAULT 1,
+    current_candidate_id uuid,
+    stop_reason text,
     deadline timestamptz NOT NULL,
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now()
 );
 DROP INDEX IF EXISTS one_active_run_per_project;
 CREATE UNIQUE INDEX one_active_run_per_project ON runs(project_id)
-    WHERE status IN ('awaiting_approval', 'queued', 'coding', 'uncertain', 'cancelling');
+    WHERE status IN ('awaiting_approval', 'queued', 'coding', 'awaiting_review', 'reviewing', 'uncertain', 'cancelling');
 
 CREATE TABLE IF NOT EXISTS contracts (
     run_id uuid NOT NULL REFERENCES runs(id),
@@ -54,11 +56,16 @@ CREATE TABLE IF NOT EXISTS approvals (
 CREATE TABLE IF NOT EXISTS tasks (
     id uuid PRIMARY KEY,
     run_id uuid NOT NULL REFERENCES runs(id),
-    kind text NOT NULL CHECK (kind = 'code_and_check'),
+    kind text NOT NULL CHECK (kind IN ('code_and_check', 'review')),
+    revision_number integer NOT NULL DEFAULT 0,
+    input_candidate_id uuid,
+    source_review_attempt_id uuid,
+    review_context jsonb,
     status text NOT NULL,
     generation integer NOT NULL DEFAULT 0,
     cancel_requested boolean NOT NULL DEFAULT false,
-    created_at timestamptz NOT NULL DEFAULT now()
+    created_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (run_id, revision_number, kind)
 );
 
 CREATE TABLE IF NOT EXISTS attempts (
@@ -71,6 +78,7 @@ CREATE TABLE IF NOT EXISTS attempts (
     started_at timestamptz NOT NULL DEFAULT now(),
     finished_at timestamptz,
     usage jsonb,
+    result_sha256 text,
     UNIQUE (task_id, generation)
 );
 
@@ -92,6 +100,20 @@ CREATE TABLE IF NOT EXISTS candidates (
     artifact_sha256 text NOT NULL,
     check_hash text NOT NULL,
     evidence jsonb NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
+ALTER TABLE runs ADD CONSTRAINT current_candidate_fk FOREIGN KEY (current_candidate_id) REFERENCES candidates(id);
+ALTER TABLE tasks ADD CONSTRAINT input_candidate_fk FOREIGN KEY (input_candidate_id) REFERENCES candidates(id);
+ALTER TABLE tasks ADD CONSTRAINT source_review_fk FOREIGN KEY (source_review_attempt_id) REFERENCES attempts(id);
+
+CREATE TABLE IF NOT EXISTS reviews (
+    attempt_id uuid PRIMARY KEY REFERENCES attempts(id),
+    raw_output text NOT NULL,
+    result jsonb,
+    validation_error text,
+    provenance jsonb NOT NULL,
+    disposition text NOT NULL CHECK (disposition IN ('accepted', 'invalid', 'stale')),
     created_at timestamptz NOT NULL DEFAULT now()
 );
 

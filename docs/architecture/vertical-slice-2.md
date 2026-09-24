@@ -1,6 +1,6 @@
 # Vertical slice 2: independent review and bounded revision
 
-Status: proposed increment after [vertical slice 1](vertical-slice-1.md). Design only. Deliver a preserved Candidate with applicable passing checks and an independent passing Review, displayed as **Ready to merge**.
+Status: implemented increment after [vertical slice 1](vertical-slice-1.md). Deliver a preserved Candidate with applicable passing checks and an independent passing Review, displayed as **Ready to merge**.
 
 ## Scope
 

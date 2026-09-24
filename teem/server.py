@@ -7,6 +7,8 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
+import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -26,6 +28,7 @@ from .common import (
     new_id,
 )
 from .db import connect, event, initialize
+from .review import ReviewInputError, build_context, validate_result
 
 
 class ApiError(Exception):
@@ -47,31 +50,34 @@ def lock_attempt_rows(conn, attempt_id):
     conn.execute("SELECT id FROM runs WHERE id=%s FOR UPDATE", (identity["run_id"],))
     conn.execute("SELECT id FROM tasks WHERE id=%s FOR UPDATE", (identity["task_id"],))
     return conn.execute("""SELECT a.*,t.run_id,t.cancel_requested,t.generation AS task_generation,
-                          r.contract_version,r.status AS run_status,
+                          t.kind,t.revision_number,t.input_candidate_id,t.review_context,t.status AS task_status,
+                          r.contract_version,r.status AS run_status,r.stop_reason,r.current_candidate_id,
                           r.deadline,c.body FROM attempts a JOIN tasks t ON t.id=a.task_id
                           JOIN runs r ON r.id=t.run_id JOIN contracts c ON c.run_id=r.id AND c.version=r.contract_version
                           WHERE a.id=%s FOR UPDATE OF a""", (attempt_id,)).fetchone()
 
 
 def expire_leases(conn):
-    queued = conn.execute("SELECT id FROM runs WHERE status='queued' AND deadline<now() ORDER BY id").fetchall()
+    queued = conn.execute("""SELECT id FROM runs WHERE status IN ('queued','awaiting_review')
+                             AND deadline<now() ORDER BY id""").fetchall()
     for candidate in queued:
         run = conn.execute("SELECT status,deadline FROM runs WHERE id=%s FOR UPDATE", (candidate["id"],)).fetchone()
-        if run["status"] != "queued" or run["deadline"] >= datetime.now(timezone.utc):
+        if run["status"] not in ("queued", "awaiting_review") or run["deadline"] >= datetime.now(timezone.utc):
             continue
-        conn.execute("UPDATE runs SET status='failed',updated_at=now() WHERE id=%s", (candidate["id"],))
-        conn.execute("UPDATE tasks SET status='failed' WHERE run_id=%s AND status='queued'", (candidate["id"],))
+        conn.execute("UPDATE runs SET status='blocked',stop_reason='deadline',updated_at=now() WHERE id=%s", (candidate["id"],))
+        conn.execute("UPDATE tasks SET status='cancelled' WHERE run_id=%s AND status='queued'", (candidate["id"],))
         event(conn, candidate["id"], "deadline_exceeded", {})
     rows = conn.execute("""SELECT a.id FROM attempts a JOIN tasks t ON t.id=a.task_id
                            JOIN runs r ON r.id=t.run_id WHERE a.status='running'
-                           AND (a.lease_until < now() OR r.deadline < now())
+                           AND (a.lease_until < now() OR (r.deadline < now() AND NOT t.cancel_requested))
                            ORDER BY r.id,t.id,a.id""").fetchall()
     for candidate in rows:
         row = lock_attempt_rows(conn, candidate["id"])
         if not row:
             continue
         now = datetime.now(timezone.utc)
-        if row["status"] != "running" or (row["lease_until"] >= now and row["deadline"] >= now):
+        if row["status"] != "running" or (row["lease_until"] >= now and
+            (row["deadline"] >= now or row["cancel_requested"])):
             continue
         conn.execute("UPDATE attempts SET status='uncertain' WHERE id=%s", (row["id"],))
         status = "cancelling" if row["cancel_requested"] else "uncertain"
@@ -79,6 +85,109 @@ def expire_leases(conn):
         conn.execute("UPDATE runs SET status=%s, updated_at=now() WHERE id=%s", (status, row["run_id"]))
         kind = "deadline_exceeded" if row["deadline"] < now else "lease_expired"
         event(conn, row["run_id"], kind, {"attempt_id": str(row["id"])})
+
+
+def attempt_count(conn, run_id):
+    return conn.execute("""SELECT count(*) AS n FROM attempts a JOIN tasks t ON t.id=a.task_id
+                           WHERE t.run_id=%s""", (run_id,)).fetchone()["n"]
+
+
+def stop_run(conn, run_id, reason, kind="blocked"):
+    conn.execute("UPDATE runs SET status=%s,stop_reason=%s,updated_at=now() WHERE id=%s", (kind, reason, run_id))
+    event(conn, run_id, "run_stopped", {"status": kind, "reason": reason})
+
+
+def revoke_ready_for_artifact(conn, candidate):
+    run = conn.execute("SELECT status,current_candidate_id FROM runs WHERE id=%s FOR UPDATE",
+                       (candidate["run_id"],)).fetchone()
+    if run["status"] == "ready_to_merge" and run["current_candidate_id"] == candidate["id"]:
+        stop_run(conn, candidate["run_id"], "integrity_failure")
+
+
+def prepare_reviews(app):
+    with connect(app.dsn) as conn:
+        rows = conn.execute("SELECT id FROM runs WHERE status='awaiting_review' ORDER BY id").fetchall()
+    for item in rows:
+        run_id = item["id"]
+        with connect(app.dsn) as conn:
+            row = conn.execute("""SELECT r.*,c.body,p.proposal,x.*,a.path AS artifact_path
+                                  FROM runs r JOIN contracts c ON c.run_id=r.id AND c.version=r.contract_version
+                                  JOIN candidates x ON x.id=r.current_candidate_id
+                                  LEFT JOIN artifacts a ON a.attempt_id=x.attempt_id
+                                  JOIN contracts p ON p.run_id=r.id AND p.version=r.contract_version
+                                  WHERE r.id=%s AND r.status='awaiting_review'""", (run_id,)).fetchone()
+            existing = conn.execute("""SELECT 1 FROM tasks WHERE run_id=%s AND kind='review'
+                                       AND input_candidate_id=(SELECT current_candidate_id FROM runs WHERE id=%s)""",
+                                    (run_id, run_id)).fetchone()
+        if not row or existing:
+            continue
+        contract = row["body"]
+        reviewer = app.reviewer
+        try:
+            if not reviewer or contract["reviewer"] != reviewer_identity(reviewer):
+                raise ReviewInputError("reviewer configuration changed")
+            if not row["artifact_path"]:
+                raise ReviewInputError("candidate bundle unavailable")
+            bundle = app.artifact_dir / row["artifact_path"]
+            try:
+                bundle_data = bundle.read_bytes()
+            except OSError as exc:
+                raise ReviewInputError("candidate bundle unavailable") from exc
+            if hashlib.sha256(bundle_data).hexdigest() != row["artifact_sha256"]:
+                raise ReviewInputError("candidate bundle integrity failure")
+            context = build_context(bundle, row, contract, reviewer)
+        except (ReviewInputError, OSError, UnicodeError, subprocess.TimeoutExpired) as exc:
+            with connect(app.dsn) as conn:
+                run = conn.execute("SELECT * FROM runs WHERE id=%s FOR UPDATE", (run_id,)).fetchone()
+                if run["status"] == "awaiting_review" and run["current_candidate_id"] == row["id"]:
+                    reason = "integrity_failure" if "bundle" in str(exc) else "review_input_unavailable"
+                    stop_run(conn, run_id, reason)
+            continue
+        with connect(app.dsn) as conn:
+            run = conn.execute("SELECT * FROM runs WHERE id=%s FOR UPDATE", (run_id,)).fetchone()
+            if run["status"] != "awaiting_review" or run["current_candidate_id"] != row["id"] or \
+               run["contract_version"] != row["contract_version"]:
+                continue
+            if run["deadline"] <= datetime.now(timezone.utc):
+                stop_run(conn, run_id, "deadline")
+                continue
+            coding = conn.execute("""SELECT t.revision_number FROM tasks t JOIN attempts a ON a.task_id=t.id
+                                     WHERE a.id=%s FOR UPDATE OF t""", (row["attempt_id"],)).fetchone()
+            if conn.execute("SELECT 1 FROM tasks WHERE run_id=%s AND kind='review' AND revision_number=%s",
+                            (run_id, coding["revision_number"])).fetchone():
+                continue
+            if attempt_count(conn, run_id) >= contract["limits"]["attempts"]:
+                stop_run(conn, run_id, "attempt_limit")
+                continue
+            conn.execute("""INSERT INTO tasks(id,run_id,kind,status,revision_number,input_candidate_id,review_context)
+                            VALUES (%s,%s,'review','queued',%s,%s,%s::jsonb)
+                            ON CONFLICT (run_id,revision_number,kind) DO NOTHING""",
+                         (new_id(), run_id, coding["revision_number"], row["id"], canonical(context)))
+            event(conn, run_id, "review_queued", {"candidate_id": str(row["id"]), "context_sha256": context["sha256"]})
+
+
+def reviewer_identity(config):
+    result = {"identity": config["identity"],
+              "instructions_sha256": hashlib.sha256(config["instructions"].encode()).hexdigest(),
+              "destination": config["destination"], "timeout": config["timeout"]}
+    if config["destination"] == "local-ollama":
+        result["model"] = config["model"]
+    return result
+
+
+def assignment(row):
+    return {"attempt_id": str(row["attempt_id"]), "task_id": str(row["task_id"]),
+            "generation": row["generation"], "project_id": row["project_id"],
+            "contract_version": row["contract_version"], "contract": row["body"],
+            "kind": row["kind"], "revision_number": row["revision_number"],
+            "input_candidate_id": str(row["input_candidate_id"]) if row["input_candidate_id"] else None,
+            "source_review_attempt_id": str(row["source_review_attempt_id"]) if row["source_review_attempt_id"] else None,
+            "source_review": row.get("source_review"),
+            "input_head": row.get("input_head"),
+            "input_artifact_sha256": row.get("input_artifact_sha256"),
+            "parent_check_evidence": row.get("parent_check_evidence"),
+            "review_context": row["review_context"], "lease_seconds": LEASE_SECONDS,
+            "deadline": row["deadline"].isoformat()}
 
 
 def page(title, content):
@@ -168,6 +277,24 @@ class Handler(BaseHTTPRequestHandler):
             if path.startswith("/worker/"):
                 if not self.auth(worker=True):
                     return
+                if path.startswith("/worker/bundle/"):
+                    candidate_id = path.split("/")[-1]
+                    with connect(self.app.dsn) as conn:
+                        candidate = conn.execute("""SELECT c.*,a.path FROM candidates c LEFT JOIN artifacts a
+                                                   ON a.attempt_id=c.attempt_id WHERE c.id=%s""",
+                                                 (candidate_id,)).fetchone()
+                        if not candidate:
+                            fail(404, "candidate not found")
+                        try:
+                            data = (self.app.artifact_dir / candidate["path"]).read_bytes() if candidate["path"] else b""
+                        except OSError:
+                            data = b""
+                        if not candidate["path"] or hashlib.sha256(data).hexdigest() != candidate["artifact_sha256"]:
+                            revoke_ready_for_artifact(conn, candidate)
+                            conn.commit()
+                            fail(409, "artifact integrity failure")
+                    self.respond(200, data, "application/x-git-bundle")
+                    return
                 fail(404, "not found")
             else:
                 if not self.auth():
@@ -227,6 +354,8 @@ class Handler(BaseHTTPRequestHandler):
                            f"<label>Project <select name='project'>{options}</select></label>"
                            "<label>Objective <textarea name='objective' required></textarea></label>"
                            "<label>Acceptance criteria <textarea name='criteria' required></textarea></label>"
+                           "<label>Revision limit <select name='revisions'><option>0</option><option>1</option>"
+                           "<option selected>2</option></select></label>"
                            f"<input type='hidden' name='dedupe_key' value='{new_id()}'>"
                            "<button>Propose</button></form><h2>Runs</h2><ul>" + items + "</ul>")
                 conn.commit()
@@ -241,26 +370,49 @@ class Handler(BaseHTTPRequestHandler):
                 ).fetchone()
                 if not run:
                     fail(404, "run not found")
-                candidate = conn.execute("SELECT * FROM candidates WHERE run_id=%s ORDER BY created_at DESC LIMIT 1", (run_id,)).fetchone()
+                candidates = conn.execute("SELECT * FROM candidates WHERE run_id=%s ORDER BY created_at,id", (run_id,)).fetchall()
+                reviews = conn.execute("""SELECT v.*,t.input_candidate_id,t.revision_number FROM reviews v
+                                          JOIN attempts a ON a.id=v.attempt_id JOIN tasks t ON t.id=a.task_id
+                                          WHERE t.run_id=%s ORDER BY v.created_at,v.attempt_id""", (run_id,)).fetchall()
+                tasks = conn.execute("SELECT kind,revision_number,status,review_context FROM tasks WHERE run_id=%s ORDER BY revision_number,kind", (run_id,)).fetchall()
                 ev = conn.execute("SELECT kind,created_at FROM events WHERE run_id=%s ORDER BY id", (run_id,)).fetchall()
                 contract = run["body"]
-                content = f"<h1>Run {run_id}</h1><p>Status: <strong>{html.escape(run['status'])}</strong></p>"
+                visible_status = "Ready to merge" if run["status"] == "ready_to_merge" else run["status"]
+                content = f"<h1>Run {run_id}</h1><p>Status: <strong>{html.escape(visible_status)}</strong></p>"
                 content += "<h2>Proposal</h2><pre>" + html.escape(json.dumps(run["proposal"], indent=2)) + "</pre>"
+                content += f"<p>Stop reason: {html.escape(run['stop_reason'] or 'none')}</p>"
+                used = attempt_count(conn, run_id)
+                rounds = max((t["revision_number"] for t in tasks if t["kind"] == "code_and_check"), default=0)
+                seconds_left = max(0, int((run["deadline"] - datetime.now(timezone.utc)).total_seconds()))
+                content += (f"<p>Round: {rounds} · Attempts remaining: {max(0,contract['limits']['attempts']-used)} · "
+                            f"revisions remaining: {max(0,contract['limits']['revisions']-rounds)} · "
+                            f"time remaining: {seconds_left} seconds · deadline: {run['deadline'].isoformat()}</p>")
                 if run["status"] == "awaiting_approval":
                     content += (f"<form method='post' action='/runs/{run_id}/approve'>"
                                 f"<input type='hidden' name='version' value='{run['contract_version']}'>"
-                                "<button name='decision' value='approve'>Approve coding and checks</button> "
+                                "<button name='decision' value='approve'>Approve coding, checks, review, and bounded revisions</button> "
                                 "<button name='decision' value='deny'>Deny</button></form>")
-                if run["status"] in ("queued", "coding", "uncertain"):
+                if run["status"] in ("queued", "coding", "awaiting_review", "reviewing", "uncertain"):
                     content += f"<form method='post' action='/runs/{run_id}/cancel'><button>Cancel</button></form>"
-                if run["status"] in ("uncertain", "failed", "checks_failed"):
+                if run["status"] in ("uncertain", "failed"):
                     content += f"<form method='post' action='/runs/{run_id}/retry'><button>Retry with new attempt</button></form>"
-                if candidate:
-                    content += (f"<h2>Candidate {candidate['head_commit']}</h2>"
+                for candidate in candidates:
+                    label = "current" if candidate["id"] == run["current_candidate_id"] else "historical"
+                    content += (f"<h2>Candidate {candidate['head_commit']} ({label})</h2>"
                                 f"<p>Base {candidate['base_commit']} · contract {candidate['contract_version']} "
                                 f"· artifact SHA-256 {candidate['artifact_sha256']}</p>"
                                 f"<p><a href='/candidates/{candidate['id']}/bundle'>Download Git bundle</a></p>"
                                 "<h3>Objective checks</h3><pre>" + html.escape(json.dumps(candidate["evidence"], indent=2)) + "</pre>")
+                for review in reviews:
+                    label = review["disposition"] if review["disposition"] != "accepted" else (
+                        "current" if review["input_candidate_id"] == run["current_candidate_id"] else "historical")
+                    content += (f"<h2>Review round {review['revision_number']} ({label})</h2>"
+                                "<pre>" + html.escape(json.dumps(review["result"] or {"error": review["validation_error"],
+                                                                           "raw_output": review["raw_output"]}, indent=2)) + "</pre>")
+                for task in tasks:
+                    if task["kind"] == "review" and task["review_context"]:
+                        content += (f"<p><a href='/tasks/{task['revision_number']}/{run_id}/context'>"
+                                    f"Review context round {task['revision_number']}</a></p>")
                 content += "<h2>Events</h2><ul>" + "".join(
                     f"<li>{html.escape(e['kind'])} — {e['created_at'].isoformat()}</li>" for e in ev
                 ) + "</ul>"
@@ -270,16 +422,33 @@ class Handler(BaseHTTPRequestHandler):
             if path.startswith("/candidates/") and path.endswith("/bundle"):
                 candidate_id = path.split("/")[2]
                 artifact = conn.execute(
-                    """SELECT a.path,a.sha256 FROM candidates c JOIN artifacts a ON a.attempt_id=c.attempt_id
+                    """SELECT a.path,a.sha256,c.run_id,c.id,c.artifact_sha256 FROM candidates c
+                       LEFT JOIN artifacts a ON a.attempt_id=c.attempt_id
                        WHERE c.id=%s""", (candidate_id,)
                 ).fetchone()
                 if not artifact:
                     fail(404, "artifact not found")
-                data = (self.app.artifact_dir / artifact["path"]).read_bytes()
-                if hashlib.sha256(data).hexdigest() != artifact["sha256"]:
+                try:
+                    data = (self.app.artifact_dir / artifact["path"]).read_bytes() if artifact["path"] else b""
+                except OSError:
+                    data = b""
+                if hashlib.sha256(data).hexdigest() != artifact["artifact_sha256"] or \
+                   artifact["sha256"] != artifact["artifact_sha256"]:
+                    revoke_ready_for_artifact(conn, artifact)
+                    conn.commit()
                     fail(500, "artifact integrity failure")
                 conn.commit()
                 self.respond(200, data, "application/x-git-bundle")
+                return
+            if path.startswith("/tasks/") and path.endswith("/context"):
+                parts = path.split("/")
+                if len(parts) != 5:
+                    fail(404, "not found")
+                task = conn.execute("""SELECT review_context FROM tasks WHERE run_id=%s AND revision_number=%s
+                                       AND kind='review'""", (parts[3], parts[2])).fetchone()
+                if not task:
+                    fail(404, "context not found")
+                self.respond(200, task["review_context"])
                 return
         fail(404, "not found")
 
@@ -300,11 +469,18 @@ class Handler(BaseHTTPRequestHandler):
                 if existing:
                     conn.commit()
                     return self.redirect("/runs/" + str(existing["id"]))
+                try:
+                    revisions = int(form.get("revisions", "2"))
+                except ValueError:
+                    fail(400, "invalid revision limit")
+                if revisions not in (0, 1, 2):
+                    fail(400, "revision limit must be 0–2")
                 body = {"objective": objective, "acceptance_criteria": criteria, "project_id": project["id"],
                         "base_commit": project["base_commit"], "context_version": 1,
-                        "allowed_actions": ["code", "check"], "checks": project["checks"],
-                        "check_hash": project["check_hash"], "limits": {"seconds": RUN_SECONDS, "attempts": 2},
-                        "delivery_condition": "preserved candidate with passing objective checks; awaiting review"}
+                        "allowed_actions": ["code", "check", "review", "revise"], "checks": project["checks"],
+                        "check_hash": project["check_hash"], "reviewer": reviewer_identity(self.app.reviewer),
+                        "limits": {"seconds": RUN_SECONDS, "attempts": 8, "revisions": revisions},
+                        "delivery_condition": "ready_to_merge after passing checks and independent passing review"}
                 proposal = {"repository": project["name"], "base_commit": project["base_commit"],
                             "allowed_actions": body["allowed_actions"], "check_plan": project["checks"],
                             "limits": body["limits"], "delivery_condition": body["delivery_condition"]}
@@ -342,9 +518,9 @@ class Handler(BaseHTTPRequestHandler):
                     if decision not in ("approve", "deny"):
                         fail(400, "specific decision required")
                     conn.execute("""INSERT INTO approvals(id,run_id,contract_version,action,decision,source,target,target_state)
-                                    VALUES (%s,%s,%s,'code_and_check',%s,'authenticated_ui',%s,'awaiting_approval')""",
+                                    VALUES (%s,%s,%s,'code_check_review',%s,'authenticated_ui',%s,'awaiting_approval')""",
                                  (new_id(), run_id, run["contract_version"], decision, run["project_id"]))
-                    event(conn, run_id, "approval_decided", {"action": "code_and_check", "decision": decision})
+                    event(conn, run_id, "approval_decided", {"action": "code_check_review", "decision": decision})
                     if decision == "approve":
                         conn.execute("""UPDATE runs SET status='queued',updated_at=now(),
                                         deadline=now()+(%s || ' seconds')::interval WHERE id=%s""", (RUN_SECONDS, run_id))
@@ -353,25 +529,31 @@ class Handler(BaseHTTPRequestHandler):
                     else:
                         conn.execute("UPDATE runs SET status='denied',updated_at=now() WHERE id=%s", (run_id,))
                 elif action == "cancel":
-                    if run["status"] not in ("queued", "coding", "uncertain"):
+                    if run["status"] not in ("queued", "coding", "awaiting_review", "reviewing", "uncertain"):
                         fail(409, "run cannot be cancelled")
-                    pending = run["status"] != "queued"
+                    pending = run["status"] in ("coding", "reviewing", "uncertain")
                     status = "cancelling" if pending else "cancelled"
                     conn.execute("UPDATE runs SET status=%s,updated_at=now() WHERE id=%s", (status, run_id))
-                    conn.execute("UPDATE tasks SET cancel_requested=true,status=%s WHERE run_id=%s", (status, run_id))
+                    conn.execute("""UPDATE tasks SET cancel_requested=true,status=%s WHERE run_id=%s
+                                    AND status IN ('queued','running','uncertain')""", (status, run_id))
                     event(conn, run_id, "cancel_requested", {})
                 elif action == "retry":
-                    if run["status"] not in ("uncertain", "failed", "checks_failed"):
+                    if run["status"] not in ("uncertain", "failed"):
                         fail(409, "run cannot be retried")
-                    task = conn.execute("SELECT * FROM tasks WHERE run_id=%s FOR UPDATE", (run_id,)).fetchone()
+                    task = conn.execute("""SELECT * FROM tasks WHERE run_id=%s AND status IN ('uncertain','failed')
+                                           ORDER BY revision_number DESC FOR UPDATE""", (run_id,)).fetchone()
+                    if not task:
+                        fail(409, "no retryable task")
                     latest = conn.execute("SELECT status FROM attempts WHERE task_id=%s ORDER BY generation DESC LIMIT 1", (task["id"],)).fetchone()
                     if latest and latest["status"] in ("running", "uncertain"):
                         fail(409, "worker reconciliation required before retry")
-                    if task["generation"] >= 2 or run["deadline"] < datetime.now(timezone.utc):
+                    if task["generation"] >= 2 or run["deadline"] < datetime.now(timezone.utc) or \
+                       attempt_count(conn, run_id) >= 8:
                         fail(409, "run limit reached")
                     conn.execute("UPDATE attempts SET status='superseded' WHERE task_id=%s AND status IN ('running','uncertain')", (task["id"],))
                     conn.execute("UPDATE tasks SET status='queued',cancel_requested=false WHERE id=%s", (task["id"],))
-                    conn.execute("UPDATE runs SET status='queued',updated_at=now() WHERE id=%s", (run_id,))
+                    phase = "awaiting_review" if task["kind"] == "review" else "queued"
+                    conn.execute("UPDATE runs SET status=%s,updated_at=now() WHERE id=%s", (phase, run_id))
                     event(conn, run_id, "retry_queued", {"next_generation": task["generation"] + 1})
                 else:
                     fail(404, "not found")
@@ -388,54 +570,117 @@ class Handler(BaseHTTPRequestHandler):
     def worker_post(self, path):
         if path == "/worker/claim":
             data = self.json_body()
-            if data.get("worker_id") != self.app.worker_id or data.get("capabilities") != ["code", "check", "bundle"]:
+            capabilities = data.get("capabilities")
+            if data.get("worker_id") != self.app.worker_id or capabilities != ["code", "check", "bundle", "review"]:
                 fail(403, "worker identity or capabilities mismatch")
+            prepare_reviews(self.app)
             with connect(self.app.dsn) as conn:
                 expire_leases(conn)
                 conn.commit()
                 existing = conn.execute("""SELECT a.id AS attempt_id,a.generation,a.status,t.id AS task_id,
-                                          t.run_id,r.project_id,r.contract_version,c.body
+                                          t.run_id,t.kind,t.revision_number,t.input_candidate_id,
+                                          t.source_review_attempt_id,t.review_context,
+                                          r.project_id,r.contract_version,r.deadline,c.body,v.result AS source_review,
+                                          parent.head_commit AS input_head,parent.artifact_sha256 AS input_artifact_sha256,
+                                          parent.evidence AS parent_check_evidence
                                           FROM attempts a JOIN tasks t ON t.id=a.task_id
                                           JOIN runs r ON r.id=t.run_id
                                           JOIN contracts c ON c.run_id=r.id AND c.version=r.contract_version
+                                          LEFT JOIN reviews v ON v.attempt_id=t.source_review_attempt_id
+                                          LEFT JOIN candidates parent ON parent.id=t.input_candidate_id
                                           WHERE a.worker_id=%s AND a.status='running'
-                                          AND a.lease_until>now() AND r.status='coding'
+                                          AND a.lease_until>now() AND r.status IN ('coding','reviewing')
                                           AND NOT t.cancel_requested AND r.deadline>now()
                                           ORDER BY a.started_at LIMIT 1""",
                                         (self.app.worker_id,)).fetchone()
                 if existing:
                     conn.commit()
-                    self.respond(200, {"assignment": {"attempt_id": str(existing["attempt_id"]),
-                        "task_id": str(existing["task_id"]), "generation": existing["generation"],
-                        "project_id": existing["project_id"], "contract_version": existing["contract_version"],
-                        "contract": existing["body"], "lease_seconds": LEASE_SECONDS}})
+                    self.respond(200, {"assignment": assignment(existing)})
                     return
                 selected = conn.execute("""SELECT t.id AS task_id FROM tasks t
                                            JOIN runs r ON r.id=t.run_id
                                            JOIN approvals a ON a.run_id=r.id AND a.contract_version=r.contract_version
-                                           WHERE t.status='queued' AND r.status='queued' AND a.action='code_and_check'
+                                           WHERE t.status='queued' AND r.status IN ('queued','awaiting_review')
+                                           AND ((t.kind='review' AND r.status='awaiting_review') OR
+                                                (t.kind='code_and_check' AND r.status='queued'))
+                                           AND a.action='code_check_review'
                                            AND a.decision='approve' AND r.deadline>now()
                                            ORDER BY t.created_at FOR UPDATE OF r SKIP LOCKED LIMIT 1""").fetchone()
                 if not selected:
                     conn.commit()
                     self.respond(200, {"assignment": None})
                     return
-                task = conn.execute("""SELECT t.*,r.project_id,r.contract_version,r.deadline,c.body
-                                       FROM tasks t JOIN runs r ON r.id=t.run_id
+                task = conn.execute("""SELECT t.*,r.project_id,r.contract_version,r.deadline,c.body,
+                                       v.result AS source_review,parent.head_commit AS input_head,
+                                       parent.artifact_sha256 AS input_artifact_sha256,
+                                       parent.evidence AS parent_check_evidence,
+                                       r.current_candidate_id FROM tasks t JOIN runs r ON r.id=t.run_id
                                        JOIN contracts c ON c.run_id=r.id AND c.version=r.contract_version
+                                       LEFT JOIN reviews v ON v.attempt_id=t.source_review_attempt_id
+                                       LEFT JOIN candidates parent ON parent.id=t.input_candidate_id
                                        WHERE t.id=%s FOR UPDATE OF t""", (selected["task_id"],)).fetchone()
+                if attempt_count(conn, task["run_id"]) >= task["body"]["limits"]["attempts"]:
+                    conn.execute("UPDATE tasks SET status='cancelled' WHERE id=%s", (task["id"],))
+                    stop_run(conn, task["run_id"], "attempt_limit")
+                    conn.commit()
+                    self.respond(200, {"assignment": None})
+                    return
+                if task["generation"] >= 2:
+                    conn.execute("UPDATE tasks SET status='failed' WHERE id=%s", (task["id"],))
+                    stop_run(conn, task["run_id"], "attempt_limit")
+                    conn.commit()
+                    self.respond(200, {"assignment": None})
+                    return
+                if task["kind"] == "code_and_check" and task["revision_number"] > 0:
+                    parent = conn.execute("""SELECT c.*,t.kind AS producing_kind,
+                                             t.revision_number AS producing_round FROM candidates c
+                                             JOIN attempts a ON a.id=c.attempt_id JOIN tasks t ON t.id=a.task_id
+                                             WHERE c.id=%s""", (task["input_candidate_id"],)).fetchone()
+                    source = conn.execute("""SELECT v.result,v.disposition,t.input_candidate_id,t.revision_number
+                                             FROM reviews v JOIN attempts a ON a.id=v.attempt_id
+                                             JOIN tasks t ON t.id=a.task_id WHERE v.attempt_id=%s""",
+                                          (task["source_review_attempt_id"],)).fetchone()
+                    if not parent or parent["run_id"] != task["run_id"] or parent["contract_version"] != task["contract_version"] or \
+                       parent["producing_kind"] != "code_and_check" or \
+                       parent["producing_round"] != task["revision_number"] - 1 or \
+                       parent["id"] != task["current_candidate_id"] or not source or source["disposition"] != "accepted" or \
+                       source["input_candidate_id"] != parent["id"] or \
+                       source["revision_number"] != task["revision_number"] - 1 or \
+                       source["result"]["verdict"] != "changes_required":
+                        conn.execute("UPDATE tasks SET status='failed' WHERE id=%s", (task["id"],))
+                        stop_run(conn, task["run_id"], "integrity_failure")
+                        conn.commit()
+                        self.respond(200, {"assignment": None})
+                        return
+                if task["kind"] == "review":
+                    parent = conn.execute("""SELECT c.*,t.revision_number AS producing_round FROM candidates c
+                                             JOIN attempts a ON a.id=c.attempt_id JOIN tasks t ON t.id=a.task_id
+                                             WHERE c.id=%s""", (task["input_candidate_id"],)).fetchone()
+                    context = task["review_context"]
+                    if not parent or parent["run_id"] != task["run_id"] or \
+                       parent["contract_version"] != task["contract_version"] or \
+                       parent["producing_round"] != task["revision_number"] or \
+                       parent["id"] != task["current_candidate_id"] or not context or \
+                       context["sha256"] != digest(context["pack"]) or \
+                       context["pack"]["candidate_id"] != str(parent["id"]) or \
+                       context["pack"]["bundle_sha256"] != parent["artifact_sha256"]:
+                        conn.execute("UPDATE tasks SET status='failed' WHERE id=%s", (task["id"],))
+                        stop_run(conn, task["run_id"], "integrity_failure")
+                        conn.commit()
+                        self.respond(200, {"assignment": None})
+                        return
                 attempt_id = new_id()
                 generation = task["generation"] + 1
                 conn.execute("UPDATE tasks SET status='running',generation=%s WHERE id=%s", (generation, task["id"]))
-                conn.execute("UPDATE runs SET status='coding',updated_at=now() WHERE id=%s", (task["run_id"],))
+                phase = "reviewing" if task["kind"] == "review" else "coding"
+                conn.execute("UPDATE runs SET status=%s,updated_at=now() WHERE id=%s", (phase, task["run_id"]))
                 conn.execute("""INSERT INTO attempts(id,task_id,generation,worker_id,status,lease_until)
                                 VALUES (%s,%s,%s,%s,'running',now()+(%s || ' seconds')::interval)""",
                              (attempt_id, task["id"], generation, self.app.worker_id, LEASE_SECONDS))
                 event(conn, task["run_id"], "attempt_assigned", {"attempt_id": attempt_id, "generation": generation})
                 conn.commit()
-                self.respond(200, {"assignment": {"attempt_id": attempt_id, "task_id": str(task["id"]),
-                    "generation": generation, "project_id": task["project_id"], "contract_version": task["contract_version"],
-                    "contract": task["body"], "lease_seconds": LEASE_SECONDS}})
+                self.respond(200, {"assignment": assignment({**task, "task_id": task["id"],
+                                                               "attempt_id": attempt_id, "generation": generation})})
                 return
         parts = path.split("/")
         if len(parts) != 4 or parts[1] != "worker":
@@ -449,21 +694,55 @@ class Handler(BaseHTTPRequestHandler):
                 row = self.lock_attempt(conn, attempt_id)
                 if data.get("generation") != row["generation"]:
                     fail(409, "stale attempt generation")
-                if row["generation"] != row["task_generation"]:
-                    conn.commit()
-                    self.respond(200, {"status": "superseded", "cancel": False})
-                    return
                 state, outcome = data.get("journal_state"), data.get("outcome")
                 if state not in ("accepted", "preparing", "executing", "ready_to_report") or \
-                   (state == "ready_to_report" and outcome not in ("candidate", "failed", "uncertain", "cancelled")) or \
+                   (state == "ready_to_report" and outcome not in ("candidate", "review", "failed", "uncertain", "cancelled")) or \
                    (state != "ready_to_report" and outcome is not None):
                     fail(400, "invalid worker journal state")
-                if row["status"] in ("candidate", "failed", "cancelled", "reconciled_uncertain", "superseded"):
+                completed_evidence = (state == "ready_to_report" and not row["result_sha256"] and
+                                      (outcome == "candidate" and row["kind"] == "code_and_check" or
+                                       outcome == "review" and row["kind"] == "review"))
+                if row["generation"] != row["task_generation"]:
+                    conn.commit()
+                    self.respond(200, {"status": "stale_evidence_pending" if completed_evidence else "superseded",
+                                       "cancel": False})
+                    return
+                late_evidence = (state == "ready_to_report" and
+                                 (outcome == "candidate" and row["kind"] == "code_and_check" or
+                                  outcome == "review" and row["kind"] == "review") and
+                                 row["deadline"] < datetime.now(timezone.utc) and not row["cancel_requested"])
+                if row["status"] == "reconciled_uncertain" and late_evidence and \
+                   row["run_status"] == "blocked" and not row["result_sha256"]:
+                    conn.commit()
+                    self.respond(200, {"status": "late_evidence_pending", "cancel": False})
+                    return
+                if completed_evidence and row["status"] in ("cancelled", "reconciled_uncertain", "superseded"):
+                    conn.commit()
+                    self.respond(200, {"status": "stale_evidence_pending", "cancel": row["cancel_requested"]})
+                    return
+                if row["status"] in ("candidate", "review", "failed", "cancelled", "reconciled_uncertain", "superseded"):
                     conn.commit()
                     self.respond(200, {"status": row["status"], "cancel": row["cancel_requested"]})
                     return
                 if row["status"] not in ("running", "uncertain"):
                     fail(409, "attempt cannot be reconciled")
+                if state == "ready_to_report" and outcome in ("candidate", "review") and row["cancel_requested"]:
+                    conn.execute("UPDATE attempts SET status='running',lease_until=now()+(%s || ' seconds')::interval WHERE id=%s",
+                                 (LEASE_SECONDS, attempt_id))
+                    event(conn, row["run_id"], "attempt_reconciled", {"attempt_id": attempt_id, "journal_state": state})
+                    conn.commit()
+                    self.respond(200, {"status": "running", "cancel": True})
+                    return
+                if late_evidence:
+                    conn.execute("UPDATE attempts SET status='reconciled_uncertain',finished_at=now() WHERE id=%s", (attempt_id,))
+                    conn.execute("UPDATE tasks SET status='failed' WHERE id=%s", (row["task_id"],))
+                    if row["run_status"] != "blocked":
+                        stop_run(conn, row["run_id"], "deadline")
+                    event(conn, row["run_id"], "attempt_reconciled", {"attempt_id": attempt_id, "journal_state": state,
+                                                                        "status": "late_evidence_pending"})
+                    conn.commit()
+                    self.respond(200, {"status": "late_evidence_pending", "cancel": False})
+                    return
                 if row["cancel_requested"]:
                     status, attempt_status = "cancelled", "cancelled"
                 elif state != "ready_to_report" or outcome == "uncertain" or row["deadline"] < datetime.now(timezone.utc):
@@ -472,14 +751,19 @@ class Handler(BaseHTTPRequestHandler):
                     conn.execute("UPDATE attempts SET status='running',lease_until=now()+(%s || ' seconds')::interval WHERE id=%s",
                                  (LEASE_SECONDS, attempt_id))
                     conn.execute("UPDATE tasks SET status='running' WHERE id=%s", (row["task_id"],))
-                    conn.execute("UPDATE runs SET status='coding',updated_at=now() WHERE id=%s", (row["run_id"],))
+                    phase = "reviewing" if row["kind"] == "review" else "coding"
+                    conn.execute("UPDATE runs SET status=%s,updated_at=now() WHERE id=%s", (phase, row["run_id"]))
                     event(conn, row["run_id"], "attempt_reconciled", {"attempt_id": attempt_id, "journal_state": state})
                     conn.commit()
                     self.respond(200, {"status": "running", "cancel": False})
                     return
                 conn.execute("UPDATE attempts SET status=%s,finished_at=now() WHERE id=%s", (attempt_status, attempt_id))
                 conn.execute("UPDATE tasks SET status=%s WHERE id=%s", (status, row["task_id"]))
-                conn.execute("UPDATE runs SET status=%s,updated_at=now() WHERE id=%s", (status, row["run_id"]))
+                if row["deadline"] < datetime.now(timezone.utc) and not row["cancel_requested"]:
+                    status = "blocked"
+                    conn.execute("UPDATE runs SET status='blocked',stop_reason='deadline',updated_at=now() WHERE id=%s", (row["run_id"],))
+                else:
+                    conn.execute("UPDATE runs SET status=%s,updated_at=now() WHERE id=%s", (status, row["run_id"]))
                 event(conn, row["run_id"], "attempt_reconciled", {"attempt_id": attempt_id, "journal_state": state, "status": status})
                 conn.commit()
                 self.respond(200, {"status": attempt_status, "cancel": row["cancel_requested"]})
@@ -491,10 +775,14 @@ class Handler(BaseHTTPRequestHandler):
                 fail(400, "artifact hash mismatch")
             with connect(self.app.dsn) as conn:
                 row = self.lock_attempt(conn, attempt_id)
-                if row["deadline"] < datetime.now(timezone.utc):
+                if row["kind"] != "code_and_check":
+                    fail(403, "review attempts cannot upload candidates")
+                stale_evidence = (not row["result_sha256"] and
+                                  (row["generation"] != row["task_generation"] or
+                                   row["status"] in ("uncertain", "reconciled_uncertain", "superseded", "cancelled")))
+                if not stale_evidence and row["deadline"] < datetime.now(timezone.utc) and not row["cancel_requested"]:
                     fail(409, "run deadline exceeded")
-                if row["status"] != "running" or row["lease_until"] < datetime.now(timezone.utc) or \
-                   row["generation"] != row["task_generation"] or row["cancel_requested"]:
+                if not stale_evidence and (row["status"] != "running" or row["lease_until"] < datetime.now(timezone.utc)):
                     fail(409, "attempt has no live lease")
                 prior = conn.execute("SELECT sha256 FROM artifacts WHERE attempt_id=%s", (attempt_id,)).fetchone()
                 if prior and prior["sha256"] != sha:
@@ -521,7 +809,55 @@ class Handler(BaseHTTPRequestHandler):
             fail(400, "generation required")
         with connect(self.app.dsn) as conn:
             row = self.lock_attempt(conn, attempt_id)
-            if row["deadline"] < datetime.now(timezone.utc):
+            if operation == "report" and row["result_sha256"]:
+                received = digest(data)
+                if received == row["result_sha256"]:
+                    conn.commit()
+                    self.respond(200, {"status": row["status"], "replay": True})
+                    return
+                event(conn, row["run_id"], "conflicting_report", {"attempt_id": attempt_id,
+                     "first_sha256": row["result_sha256"], "conflicting_sha256": received})
+                affects_current = (
+                    row["kind"] == "review" and row["input_candidate_id"] == row["current_candidate_id"] or
+                    row["kind"] == "code_and_check" and conn.execute(
+                        "SELECT 1 FROM candidates WHERE id=%s AND attempt_id=%s",
+                        (row["current_candidate_id"], row["id"])).fetchone())
+                if affects_current and row["run_status"] in ("awaiting_review", "ready_to_merge", "queued"):
+                    stop_run(conn, row["run_id"], "integrity_failure")
+                conn.commit()
+                fail(409, "conflicting final report")
+            if operation == "report" and row["status"] == "reconciled_uncertain" and \
+               row["run_status"] == "blocked" and row["deadline"] < datetime.now(timezone.utc) and \
+               data.get("generation") == row["generation"] == row["task_generation"] and \
+               (data.get("outcome") == "candidate" and row["kind"] == "code_and_check" or
+                data.get("outcome") == "review" and row["kind"] == "review"):
+                if row["kind"] == "code_and_check":
+                    self.save_candidate(conn, row, data)
+                else:
+                    self.save_review(conn, row, data, "stale", "run deadline exceeded")
+                conn.execute("UPDATE attempts SET status=%s,result_sha256=%s WHERE id=%s",
+                             (data["outcome"], digest(data), attempt_id))
+                event(conn, row["run_id"], "stale_report", {"attempt_id": attempt_id, "sha256": digest(data)})
+                conn.commit()
+                self.respond(200, {"status": "stale"})
+                return
+            stale_evidence = (operation == "report" and data.get("generation") == row["generation"] and
+                              (data.get("outcome") == "candidate" and row["kind"] == "code_and_check" or
+                               data.get("outcome") == "review" and row["kind"] == "review") and
+                              (row["generation"] != row["task_generation"] or
+                               row["status"] in ("uncertain", "reconciled_uncertain", "superseded", "cancelled")))
+            if stale_evidence:
+                if row["kind"] == "code_and_check":
+                    self.save_candidate(conn, row, data)
+                else:
+                    self.save_review(conn, row, data, "stale", "obsolete attempt")
+                conn.execute("UPDATE attempts SET status=%s,finished_at=COALESCE(finished_at,now()),result_sha256=%s WHERE id=%s",
+                             (data["outcome"], digest(data), attempt_id))
+                event(conn, row["run_id"], "stale_report", {"attempt_id": attempt_id, "sha256": digest(data)})
+                conn.commit()
+                self.respond(200, {"status": "stale"})
+                return
+            if row["deadline"] < datetime.now(timezone.utc) and not (operation == "report" and row["cancel_requested"]):
                 fail(409, "run deadline exceeded")
             if row["generation"] != data["generation"] or row["generation"] != row["task_generation"] or \
                row["status"] != "running" or row["lease_until"] < datetime.now(timezone.utc):
@@ -538,20 +874,86 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if operation == "report":
                 outcome = data.get("outcome")
-                if outcome not in ("candidate", "failed", "uncertain", "cancelled"):
+                if outcome not in ("candidate", "review", "failed", "uncertain", "cancelled"):
                     fail(400, "invalid outcome")
                 if row["cancel_requested"] and outcome != "cancelled":
-                    fail(409, "run cancelled")
-                status = {"candidate": "awaiting_review", "failed": "failed", "uncertain": "uncertain", "cancelled": "cancelled"}[outcome]
+                    if outcome == "review":
+                        self.save_review(conn, row, data, "stale", "run cancelled")
+                    elif outcome == "candidate":
+                        self.save_candidate(conn, row, data)
+                    conn.execute("UPDATE attempts SET status=%s,finished_at=now(),result_sha256=%s WHERE id=%s",
+                                 (outcome, digest(data), attempt_id))
+                    conn.execute("UPDATE tasks SET status='cancelled' WHERE id=%s", (row["task_id"],))
+                    conn.execute("UPDATE runs SET status='cancelled',updated_at=now() WHERE id=%s", (row["run_id"],))
+                    event(conn, row["run_id"], "late_evidence_preserved", {"attempt_id": attempt_id, "outcome": outcome})
+                    conn.commit()
+                    self.respond(200, {"status": "cancelled"})
+                    return
+                if outcome == "candidate" and row["kind"] != "code_and_check" or \
+                   outcome == "review" and row["kind"] != "review":
+                    fail(400, "outcome does not match task kind")
+                status = {"candidate": "awaiting_review", "review": "reviewing", "failed": "failed",
+                          "uncertain": "uncertain", "cancelled": "cancelled"}[outcome]
+                if outcome == "failed" and data.get("failure_kind") == "policy":
+                    status = "blocked"
+                    conn.execute("UPDATE runs SET stop_reason='integrity_failure' WHERE id=%s", (row["run_id"],))
                 if outcome == "candidate":
-                    self.save_candidate(conn, row, data)
+                    candidate_id = self.save_candidate(conn, row, data)
                     checks = data["evidence"]["checks"]
+                    conn.execute("UPDATE runs SET current_candidate_id=%s WHERE id=%s", (candidate_id, row["run_id"]))
                     if any(item["exit_code"] != 0 for item in checks):
                         status = "checks_failed"
-                attempt_status = "reconciled_uncertain" if outcome == "uncertain" else outcome
-                conn.execute("UPDATE attempts SET status=%s,finished_at=now(),usage=%s::jsonb WHERE id=%s",
-                             (attempt_status, canonical(data.get("usage", {})), attempt_id))
-                conn.execute("UPDATE tasks SET status=%s WHERE id=%s", (status, row["task_id"]))
+                elif outcome == "review":
+                    review, error = self.save_review(conn, row, data, "accepted")
+                    conflict = conn.execute("""SELECT 1 FROM events e JOIN candidates c ON c.id=%s
+                                               WHERE e.run_id=%s AND e.kind='conflicting_report'
+                                               AND e.payload->>'attempt_id' IN (c.attempt_id::text,%s) LIMIT 1""",
+                                            (row["input_candidate_id"], row["run_id"], str(row["id"]))).fetchone()
+                    if conflict:
+                        status = "blocked"
+                        conn.execute("UPDATE runs SET stop_reason='integrity_failure' WHERE id=%s", (row["run_id"],))
+                    elif error:
+                        status = "failed"
+                    elif review["verdict"] == "pass":
+                        try:
+                            self.validate_readiness(conn, row)
+                            status = "ready_to_merge"
+                        except ReviewInputError:
+                            status = "blocked"
+                            conn.execute("UPDATE runs SET stop_reason='integrity_failure' WHERE id=%s", (row["run_id"],))
+                    elif review["verdict"] == "blocked":
+                        status = "blocked"
+                        conn.execute("UPDATE runs SET stop_reason='review_uncertain' WHERE id=%s", (row["run_id"],))
+                    else:
+                        contract = row["body"]
+                        if row["revision_number"] >= contract["limits"]["revisions"]:
+                            status = "blocked"
+                            conn.execute("UPDATE runs SET stop_reason='revision_limit' WHERE id=%s", (row["run_id"],))
+                        elif attempt_count(conn, row["run_id"]) >= contract["limits"]["attempts"]:
+                            status = "blocked"
+                            conn.execute("UPDATE runs SET stop_reason='attempt_limit' WHERE id=%s", (row["run_id"],))
+                        else:
+                            conn.execute("""INSERT INTO tasks(id,run_id,kind,status,revision_number,input_candidate_id,
+                                            source_review_attempt_id) VALUES (%s,%s,'code_and_check','queued',%s,%s,%s)""",
+                                         (new_id(), row["run_id"], row["revision_number"] + 1,
+                                          row["input_candidate_id"], row["id"]))
+                            status = "queued"
+                            event(conn, row["run_id"], "revision_queued", {"parent_candidate_id": str(row["input_candidate_id"]),
+                                                                            "round": row["revision_number"] + 1})
+                attempt_status = ("reconciled_uncertain" if outcome == "uncertain" else
+                                  "failed" if outcome == "review" and error else outcome)
+                if status == "failed" and outcome != "candidate":
+                    if row["generation"] < 2 and attempt_count(conn, row["run_id"]) < row["body"]["limits"]["attempts"]:
+                        status = "awaiting_review" if row["kind"] == "review" else "queued"
+                    elif attempt_count(conn, row["run_id"]) >= row["body"]["limits"]["attempts"]:
+                        status = "blocked"
+                        conn.execute("UPDATE runs SET stop_reason='attempt_limit' WHERE id=%s", (row["run_id"],))
+                conn.execute("UPDATE attempts SET status=%s,finished_at=now(),usage=%s::jsonb,result_sha256=%s WHERE id=%s",
+                             (attempt_status, canonical(data.get("usage", {})), digest(data), attempt_id))
+                task_status = ("succeeded" if outcome == "candidate" or outcome == "review" and not error else
+                               "queued" if status in ("queued", "awaiting_review") else
+                               "cancelled" if status == "cancelled" else "uncertain" if status == "uncertain" else "failed")
+                conn.execute("UPDATE tasks SET status=%s WHERE id=%s", (task_status, row["task_id"]))
                 conn.execute("UPDATE runs SET status=%s,updated_at=now() WHERE id=%s", (status, row["run_id"]))
                 event(conn, row["run_id"], "attempt_reported", {"attempt_id": attempt_id, "outcome": outcome, "run_status": status})
                 conn.commit()
@@ -611,11 +1013,115 @@ class Handler(BaseHTTPRequestHandler):
             if subprocess.run(["git", "merge-base", "--is-ancestor", data["base_commit"], data["head_commit"]],
                               cwd=checkout, capture_output=True, timeout=30).returncode:
                 fail(400, "candidate does not descend from base")
+            if row["input_candidate_id"]:
+                parent = conn.execute("SELECT * FROM candidates WHERE id=%s", (row["input_candidate_id"],)).fetchone()
+                if not parent or parent["run_id"] != row["run_id"] or parent["contract_version"] != row["contract_version"] or \
+                   parent["base_commit"] != data["base_commit"] or parent["head_commit"] == data["head_commit"] or \
+                   subprocess.run(["git", "merge-base", "--is-ancestor", parent["head_commit"], data["head_commit"]],
+                                  cwd=checkout, capture_output=True, timeout=30).returncode:
+                    fail(400, "revision does not descend from parent")
+        candidate_id = new_id()
         conn.execute("""INSERT INTO candidates(id,run_id,attempt_id,contract_version,base_commit,head_commit,
                         artifact_sha256,check_hash,evidence) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)""",
-                     (new_id(), row["run_id"], row["id"], row["contract_version"], data["base_commit"],
+                     (candidate_id, row["run_id"], row["id"], row["contract_version"], data["base_commit"],
                       data["head_commit"], artifact["sha256"], contract["check_hash"], canonical(evidence)))
         event(conn, row["run_id"], "candidate_preserved", {"attempt_id": str(row["id"]), "head_commit": data["head_commit"]})
+        return candidate_id
+
+    def save_review(self, conn, row, data, disposition, stale_reason=None):
+        context = row["review_context"]
+        if not context or row["input_candidate_id"] != row["current_candidate_id"]:
+            disposition, stale_reason = "stale", "candidate is no longer current"
+        raw = data.get("raw_output", "")
+        error = data.get("validation_error")
+        if not isinstance(raw, str):
+            raw = ""
+            error = "review output must be text"
+        raw_bytes = raw.encode()
+        if error is not None and (not isinstance(error, str) or not error.strip()):
+            error = "invalid review execution diagnostic"
+        if len(raw_bytes) > 16 * 1024:
+            raw = raw_bytes[:16 * 1024].decode(errors="ignore")
+            error = "review output exceeds cap"
+        result = None
+        if not error:
+            try:
+                result = validate_result(raw, context, row["body"])
+            except (ValueError, TypeError, KeyError) as exc:
+                error = str(exc)[:500]
+        provenance = data.get("provenance")
+        reviewer = row["body"]["reviewer"]
+        if not isinstance(provenance, dict) or set(provenance) != {"runner_identity", "instructions_sha256",
+               "context_sha256", "started_at", "ended_at"} or \
+           provenance.get("runner_identity") != reviewer["identity"] or \
+           provenance.get("instructions_sha256") != reviewer["instructions_sha256"] or \
+           provenance.get("context_sha256") != context["sha256"]:
+            error = "review provenance mismatch"
+        else:
+            try:
+                started = datetime.fromisoformat(provenance["started_at"])
+                ended = datetime.fromisoformat(provenance["ended_at"])
+                if started.tzinfo is None or ended.tzinfo is None or started > ended:
+                    raise ValueError
+            except (ValueError, TypeError):
+                error = "review invocation times invalid"
+        if error:
+            disposition = "invalid"
+            result = None
+        elif stale_reason:
+            error = stale_reason
+        conn.execute("""INSERT INTO reviews(attempt_id,raw_output,result,validation_error,provenance,disposition)
+                        VALUES (%s,%s,%s::jsonb,%s,%s::jsonb,%s)""",
+                     (row["id"], raw, canonical(result) if result else None, error,
+                      canonical(provenance if isinstance(provenance, dict) else {}), disposition))
+        event(conn, row["run_id"], "review_preserved", {"attempt_id": str(row["id"]),
+                                                        "disposition": disposition,
+                                                        "verdict": result["verdict"] if result else None})
+        return result, error
+
+    def validate_readiness(self, conn, row):
+        candidate = conn.execute("""SELECT c.*,a.path,a.sha256,p.status AS producer_status
+                                    FROM candidates c JOIN artifacts a ON a.attempt_id=c.attempt_id
+                                    JOIN attempts p ON p.id=c.attempt_id WHERE c.id=%s""",
+                                 (row["input_candidate_id"],)).fetchone()
+        if not candidate or candidate["run_id"] != row["run_id"] or \
+           candidate["contract_version"] != row["contract_version"] or \
+           candidate["id"] != row["current_candidate_id"] or \
+           candidate["producer_status"] != "candidate" or \
+           candidate["check_hash"] != row["body"]["check_hash"] or \
+           candidate["evidence"]["base_commit"] != candidate["base_commit"] or \
+           candidate["evidence"]["head_commit"] != candidate["head_commit"] or \
+           candidate["evidence"]["check_hash"] != row["body"]["check_hash"] or \
+           any(check["exit_code"] != 0 for check in candidate["evidence"]["checks"]):
+            raise ReviewInputError("candidate does not qualify for readiness")
+        review = conn.execute("SELECT disposition,result FROM reviews WHERE attempt_id=%s", (row["id"],)).fetchone()
+        if not review or review["disposition"] != "accepted" or review["result"]["verdict"] != "pass" or \
+           row["cancel_requested"] or row["deadline"] <= datetime.now(timezone.utc) or \
+           row["run_status"] != "reviewing":
+            raise ReviewInputError("review does not qualify for readiness")
+        unresolved = conn.execute("""SELECT 1 FROM attempts a JOIN tasks t ON t.id=a.task_id
+                                     WHERE t.run_id=%s AND a.id<>%s AND a.status IN ('running','uncertain')
+                                     LIMIT 1""", (row["run_id"], row["id"])).fetchone()
+        conflict = conn.execute("""SELECT 1 FROM events WHERE run_id=%s AND kind='conflicting_report'
+                                   AND payload->>'attempt_id' IN (%s,%s) LIMIT 1""",
+                                (row["run_id"], str(candidate["attempt_id"]), str(row["id"]))).fetchone()
+        if unresolved or conflict:
+            raise ReviewInputError("current evidence is unresolved or conflicting")
+        try:
+            data = (self.app.artifact_dir / candidate["path"]).read_bytes()
+        except OSError:
+            data = b""
+        if hashlib.sha256(data).hexdigest() != candidate["sha256"]:
+            raise ReviewInputError("candidate artifact integrity failure")
+        context = row["review_context"]
+        if context["sha256"] != digest(context["pack"]) or \
+           context["pack"]["candidate_id"] != str(candidate["id"]) or \
+           context["pack"]["bundle_sha256"] != candidate["sha256"] or \
+           context["pack"]["contract_sha256"] != digest(row["body"]) or \
+           context["pack"]["runner_identity"] != row["body"]["reviewer"]["identity"] or \
+           context["pack"]["check_hash"] != row["body"]["check_hash"] or \
+           context["pack"]["check_evidence"] != candidate["evidence"]:
+            raise ReviewInputError("review context does not qualify")
 
 
 class App:
@@ -634,6 +1140,29 @@ class App:
         self.worker_id = args.worker_id
         self.worker_token = args.worker_token
         self.origin = args.origin
+        reviewer_path = getattr(args, "reviewer_config", None)
+        self.reviewer = json.loads(Path(reviewer_path).read_text()) if reviewer_path else None
+        if not self.reviewer or set(self.reviewer) not in (
+            {"identity", "instructions", "destination", "timeout"},
+            {"identity", "instructions", "destination", "timeout", "model"}) or \
+           not isinstance(self.reviewer["identity"], str) or not self.reviewer["identity"] or \
+           not isinstance(self.reviewer["instructions"], str) or not self.reviewer["instructions"] or \
+           self.reviewer["destination"] not in ("local", "local-ollama") or \
+           (self.reviewer["destination"] == "local-ollama") != ("model" in self.reviewer) or \
+           ("model" in self.reviewer and (not isinstance(self.reviewer["model"], str) or not self.reviewer["model"])) or \
+           type(self.reviewer["timeout"]) is not int or \
+           not 1 <= self.reviewer["timeout"] <= 900:
+            raise ValueError("invalid server reviewer configuration")
+
+    def sweep(self):
+        while True:
+            try:
+                with connect(self.dsn) as conn:
+                    expire_leases(conn)
+                prepare_reviews(self)
+            except (psycopg.Error, OSError, ReviewInputError):
+                pass
+            time.sleep(2)
 
 
 def main():
@@ -655,6 +1184,7 @@ def main():
     serve.add_argument("--worker-id", required=True)
     serve.add_argument("--worker-token", required=True)
     serve.add_argument("--origin", required=True, help="External HTTPS origin, e.g. https://teem.example")
+    serve.add_argument("--reviewer-config", required=True, help="server-owned local review identity and instructions JSON")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
@@ -672,6 +1202,7 @@ def main():
             parser.error("password, worker token, and HTTPS origin required")
         server = ThreadingHTTPServer((args.host, args.port), Handler)
         server.app = App(args)
+        threading.Thread(target=server.app.sweep, daemon=True).start()
         server.serve_forever()
 
 
