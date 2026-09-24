@@ -5,12 +5,14 @@ import hmac
 import html
 import json
 import os
+import socket
 import subprocess
 import tempfile
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer as HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -29,6 +31,8 @@ from .common import (
 )
 from .db import connect, event, initialize
 from .review import ReviewInputError, build_context, validate_result
+from .push import sender_loop, valid_subscription, vapid_public_key
+from .speech import MAX_AUDIO, SpeechError, SpeechRunner
 
 
 class ApiError(Exception):
@@ -66,7 +70,7 @@ def expire_leases(conn):
             continue
         conn.execute("UPDATE runs SET status='blocked',stop_reason='deadline',updated_at=now() WHERE id=%s", (candidate["id"],))
         conn.execute("UPDATE tasks SET status='cancelled' WHERE run_id=%s AND status='queued'", (candidate["id"],))
-        event(conn, candidate["id"], "deadline_exceeded", {})
+        event(conn, candidate["id"], "deadline_exceeded", {}, notify=True)
     rows = conn.execute("""SELECT a.id FROM attempts a JOIN tasks t ON t.id=a.task_id
                            JOIN runs r ON r.id=t.run_id WHERE a.status='running'
                            AND (a.lease_until < now() OR (r.deadline < now() AND NOT t.cancel_requested))
@@ -84,7 +88,7 @@ def expire_leases(conn):
         conn.execute("UPDATE tasks SET status=%s WHERE id=%s", (status, row["task_id"]))
         conn.execute("UPDATE runs SET status=%s, updated_at=now() WHERE id=%s", (status, row["run_id"]))
         kind = "deadline_exceeded" if row["deadline"] < now else "lease_expired"
-        event(conn, row["run_id"], kind, {"attempt_id": str(row["id"])})
+        event(conn, row["run_id"], kind, {"attempt_id": str(row["id"])}, notify=status == "uncertain" and row["run_status"] != "uncertain")
 
 
 def attempt_count(conn, run_id):
@@ -93,8 +97,10 @@ def attempt_count(conn, run_id):
 
 
 def stop_run(conn, run_id, reason, kind="blocked"):
+    prior = conn.execute("SELECT status FROM runs WHERE id=%s", (run_id,)).fetchone()["status"]
     conn.execute("UPDATE runs SET status=%s,stop_reason=%s,updated_at=now() WHERE id=%s", (kind, reason, run_id))
-    event(conn, run_id, "run_stopped", {"status": kind, "reason": reason})
+    event(conn, run_id, "run_stopped", {"status": kind, "reason": reason},
+          notify=prior != kind and kind in ("blocked", "failed", "checks_failed", "uncertain"))
 
 
 def revoke_ready_for_artifact(conn, candidate):
@@ -195,12 +201,62 @@ def page(title, content):
             "<meta name='viewport' content='width=device-width,initial-scale=1'>"
             "<meta name='theme-color' content='#172337'>"
             "<link rel='manifest' href='/manifest.webmanifest'>"
+            "<link rel='apple-touch-icon' href='/icon-192.png'>"
             f"<title>{html.escape(title)}</title>"
             "<style>body{font:16px system-ui;max-width:52rem;margin:2rem auto;padding:0 1rem;line-height:1.5}"
             "input,textarea,select,button{font:inherit;padding:.45rem}textarea{width:100%;box-sizing:border-box}"
             "label{display:block;margin:.8rem 0}pre{white-space:pre-wrap;background:#eee;padding:1rem}"
             "li{margin:.5rem 0}a{color:#064c9e}</style>"
-            "<header><a href='/'>Teem</a></header>" + content + "</html>").encode()
+            "<header><a href='/'>Teem</a></header>" + content +
+            "<script src='/phone.js' defer></script></html>").encode()
+
+
+STATUS_LABELS = {"awaiting_approval": "Decision required", "queued": "Queued",
+                 "coding": "Coding and checks", "awaiting_review": "Awaiting review",
+                 "reviewing": "Independent review", "uncertain": "Execution unresolved",
+                 "cancelling": "Cancellation unresolved", "failed": "Execution failed",
+                 "checks_failed": "Checks failed", "blocked": "Stopped",
+                 "ready_to_merge": "Ready to merge", "denied": "Denied", "cancelled": "Cancelled"}
+
+
+class ThreadingHTTPServer(HTTPServer):
+    daemon_threads = True
+
+    def server_close(self):
+        if hasattr(self, "app"):
+            self.app.stop()
+        super().server_close()
+
+
+def status_rows(conn, run_id=None):
+    rows = conn.execute("""SELECT r.id,r.project_id,p.name AS project_name,r.status,r.stop_reason,
+                          r.updated_at,c.body,r.current_candidate_id,
+                          COALESCE((SELECT max(t.revision_number) FROM tasks t WHERE t.run_id=r.id
+                                    AND t.kind='code_and_check'),0) AS round
+                          FROM runs r JOIN projects p ON p.id=r.project_id
+                          JOIN contracts c ON c.run_id=r.id AND c.version=r.contract_version
+                          WHERE (%s::uuid IS NULL OR r.id=%s::uuid)
+                          ORDER BY (r.status='awaiting_approval') DESC,r.updated_at DESC LIMIT 30""",
+                        (run_id, run_id)).fetchall()
+    result = []
+    for row in rows:
+        candidate = conn.execute("SELECT evidence FROM candidates WHERE id=%s", (row["current_candidate_id"],)).fetchone() if row["current_candidate_id"] else None
+        review = conn.execute("""SELECT v.result,v.disposition FROM reviews v JOIN attempts a ON a.id=v.attempt_id
+                               JOIN tasks t ON t.id=a.task_id WHERE t.run_id=%s
+                               ORDER BY v.created_at DESC,v.attempt_id DESC LIMIT 1""", (row["id"],)).fetchone()
+        checks = candidate["evidence"].get("checks", []) if candidate else []
+        summary = f"{sum(c['exit_code'] == 0 for c in checks)}/{len(checks)} checks passed" if checks else "Checks pending"
+        if review:
+            verdict = review["result"]["verdict"] if review["result"] else review["disposition"]
+            summary += f"; review: {verdict}"
+        else:
+            summary += "; review pending"
+        result.append({"id": str(row["id"]), "project": row["project_name"],
+                       "objective": row["body"]["objective"], "status": row["status"],
+                       "label": STATUS_LABELS.get(row["status"], row["status"]),
+                       "round": row["round"], "summary": summary,
+                       "stop_reason": row["stop_reason"], "updated_at": row["updated_at"].isoformat()})
+    return result
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -274,6 +330,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         try:
             path = urlparse(self.path).path
+            if path in ("/manifest.webmanifest", "/icon.svg", "/icon-192.png", "/icon-512.png",
+                        "/phone.js", "/sw.js"):
+                self.static_get(path)
+                return
             if path.startswith("/worker/"):
                 if not self.auth(worker=True):
                     return
@@ -305,6 +365,23 @@ class Handler(BaseHTTPRequestHandler):
         except psycopg.errors.InvalidTextRepresentation:
             self.respond(400, {"error": "invalid identifier"})
 
+    def static_get(self, path):
+        if path == "/manifest.webmanifest":
+            data = {"id": "/", "name": "Teem", "short_name": "Teem", "start_url": "/",
+                    "scope": "/", "display": "standalone", "theme_color": "#172337",
+                    "background_color": "#ffffff",
+                    "icons": [{"src": "/icon-192.png", "sizes": "192x192", "type": "image/png"},
+                              {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png"}]}
+            self.respond(200, canonical(data).encode(), "application/manifest+json")
+            return
+        static = Path(__file__).with_name("static")
+        name, content_type = {"/icon.svg": ("icon.svg", "image/svg+xml"),
+                              "/icon-192.png": ("icon-192.png", "image/png"),
+                              "/icon-512.png": ("icon-512.png", "image/png"),
+                              "/phone.js": ("phone.js", "text/javascript; charset=utf-8"),
+                              "/sw.js": ("sw.js", "text/javascript; charset=utf-8")}[path]
+        self.respond(200, (static / name).read_bytes(), content_type)
+
     def do_POST(self):
         try:
             path = urlparse(self.path).path
@@ -323,7 +400,59 @@ class Handler(BaseHTTPRequestHandler):
         except psycopg.errors.UniqueViolation:
             self.respond(409, {"error": "conflicting active run or duplicate decision"})
 
+    def transcribe(self):
+        speech = self.app.speech
+        if speech is None:
+            fail(503, "local recognition unavailable")
+        if not speech.lock.acquire(blocking=False):
+            fail(429, "transcription busy")
+        try:
+            media_type = self.headers.get("Content-Type", "").split(";", 1)[0].lower()
+            try:
+                length = int(self.headers.get("Content-Length", "-1"))
+            except ValueError:
+                fail(400, "invalid content length")
+            if length <= 0 or length > MAX_AUDIO:
+                fail(413, "recording too large or empty")
+            deadline = time.monotonic() + 30
+            parts = []
+            try:
+                while length:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        fail(408, "upload timed out")
+                    self.connection.settimeout(remaining)
+                    part = self.rfile.read(min(length, 65536))
+                    if not part:
+                        fail(400, "incomplete recording")
+                    parts.append(part)
+                    length -= len(part)
+            except (socket.timeout, TimeoutError):
+                fail(408, "upload timed out")
+            audio = b"".join(parts)
+            try:
+                text = speech._transcribe(audio, media_type)
+            except SpeechError as exc:
+                fail(400 if "invalid" in str(exc) or "unsupported" in str(exc) else 504,
+                     str(exc))
+            self.respond(200, {"text": text})
+        finally:
+            speech.lock.release()
+
     def browser_get(self, path):
+        if path == "/config":
+            self.respond(200, {"vapid_public_key": self.app.vapid_public_key,
+                               "speech_available": self.app.speech is not None})
+            return
+        if path == "/state" or path.startswith("/runs/") and path.endswith("/state"):
+            run_id = path.split("/")[2] if path != "/state" else None
+            with connect(self.app.dsn) as conn:
+                expire_leases(conn)
+                rows = status_rows(conn, run_id)
+                if run_id and not rows:
+                    fail(404, "run not found")
+            self.respond(200, {"refreshed_at": datetime.now(timezone.utc).isoformat(), "runs": rows})
+            return
         if path == "/manifest.webmanifest":
             data = {"name": "Teem", "short_name": "Teem", "start_url": "/",
                     "display": "standalone", "theme_color": "#172337", "background_color": "#ffffff",
@@ -342,22 +471,31 @@ class Handler(BaseHTTPRequestHandler):
             conn.commit()
             if path == "/":
                 projects = conn.execute("SELECT id,name FROM projects ORDER BY name").fetchall()
-                runs = conn.execute(
-                    "SELECT id,project_id,status,created_at FROM runs ORDER BY created_at DESC LIMIT 30"
-                ).fetchall()
+                runs = status_rows(conn)
                 options = "".join(f"<option value='{html.escape(p['id'])}'>{html.escape(p['name'])}</option>" for p in projects)
                 items = "".join(
-                    f"<li><a href='/runs/{r['id']}'>{html.escape(r['project_id'])}: {r['id']}</a> — {html.escape(r['status'])}</li>"
+                    f"<li><a href='/runs/{r['id']}'>{html.escape(r['project'])}: {html.escape(r['objective'])}</a>"
+                    f" — {html.escape(r['label'])}, round {r['round']}. {html.escape(r['summary'])}</li>"
                     for r in runs
                 )
                 content = ("<h1>New coding request</h1><form method='post' action='/requests'>"
                            f"<label>Project <select name='project'>{options}</select></label>"
-                           "<label>Objective <textarea name='objective' required></textarea></label>"
-                           "<label>Acceptance criteria <textarea name='criteria' required></textarea></label>"
+                           "<p>Local recognition runs on the Teem server, not this phone. A recording is uploaded"
+                           " to this server for transcription and is discarded afterward.</p>"
+                           "<label>Objective <textarea id='objective' name='objective' required></textarea></label>"
+                           "<button type='button' class='mic' data-field='objective' aria-label='Record objective'>🎙 Record objective</button>"
+                           "<label>Acceptance criteria <textarea id='criteria' name='criteria' required></textarea></label>"
+                           "<button type='button' class='mic' data-field='criteria' aria-label='Record acceptance criteria'>🎙 Record criteria</button>"
+                           "<p id='recording-status' role='status' aria-live='polite'></p>"
                            "<label>Revision limit <select name='revisions'><option>0</option><option>1</option>"
                            "<option selected>2</option></select></label>"
                            f"<input type='hidden' name='dedupe_key' value='{new_id()}'>"
-                           "<button>Propose</button></form><h2>Runs</h2><ul>" + items + "</ul>")
+                           "<button>Propose</button></form>"
+                           "<section id='notifications'><button type='button' id='enable-push'>Enable notifications</button> "
+                           "<button type='button' id='disable-push'>Disable notifications</button> "
+                           "<span id='push-status' role='status'></span></section>"
+                           "<p id='refresh-status' role='status'></p><h2>Pending approvals and Runs</h2>"
+                           "<ul id='run-list'>" + items + "</ul>")
                 conn.commit()
                 self.respond(200, page("Teem", content), "text/html; charset=utf-8")
                 return
@@ -377,9 +515,13 @@ class Handler(BaseHTTPRequestHandler):
                 tasks = conn.execute("SELECT kind,revision_number,status,review_context FROM tasks WHERE run_id=%s ORDER BY revision_number,kind", (run_id,)).fetchall()
                 ev = conn.execute("SELECT kind,created_at FROM events WHERE run_id=%s ORDER BY id", (run_id,)).fetchall()
                 contract = run["body"]
-                visible_status = "Ready to merge" if run["status"] == "ready_to_merge" else run["status"]
-                content = f"<h1>Run {run_id}</h1><p>Status: <strong>{html.escape(visible_status)}</strong></p>"
+                visible_status = STATUS_LABELS.get(run["status"], run["status"])
+                content = (f"<h1>Run {run_id}</h1><p>{html.escape(contract['project_id'])}: "
+                           f"{html.escape(contract['objective'])}</p><p>Status: <strong id='run-status' "
+                           f"data-status='{html.escape(run['status'])}'>{html.escape(visible_status)}</strong></p>")
                 content += "<h2>Proposal</h2><pre>" + html.escape(json.dumps(run["proposal"], indent=2)) + "</pre>"
+                if run["status"] == "awaiting_approval":
+                    content += "<h2>Exact scope for this decision</h2><pre>" + html.escape(json.dumps(contract, indent=2)) + "</pre>"
                 content += f"<p>Stop reason: {html.escape(run['stop_reason'] or 'none')}</p>"
                 used = attempt_count(conn, run_id)
                 rounds = max((t["revision_number"] for t in tasks if t["kind"] == "code_and_check"), default=0)
@@ -415,7 +557,7 @@ class Handler(BaseHTTPRequestHandler):
                                     f"Review context round {task['revision_number']}</a></p>")
                 content += "<h2>Events</h2><ul>" + "".join(
                     f"<li>{html.escape(e['kind'])} — {e['created_at'].isoformat()}</li>" for e in ev
-                ) + "</ul>"
+                ) + "</ul><p id='refresh-status' role='status'></p>"
                 conn.commit()
                 self.respond(200, page("Run", content), "text/html; charset=utf-8")
                 return
@@ -453,6 +595,42 @@ class Handler(BaseHTTPRequestHandler):
         fail(404, "not found")
 
     def browser_post(self, path):
+        if path == "/transcribe":
+            return self.transcribe()
+        if path == "/push/subscribe":
+            if not self.app.vapid_public_key:
+                fail(503, "notifications unavailable")
+            data = self.json_body()
+            if not valid_subscription(data):
+                fail(400, "invalid push subscription")
+            previous = data.get("previous_id")
+            # A replaced install may remove its old endpoint after registering a new one.
+            with connect(self.app.dsn) as conn:
+                row = conn.execute("""INSERT INTO push_subscriptions(id,endpoint,p256dh,auth)
+                                      VALUES (%s,%s,%s,%s)
+                                      ON CONFLICT (endpoint) DO UPDATE SET p256dh=EXCLUDED.p256dh,auth=EXCLUDED.auth
+                                      RETURNING id""",
+                                   (new_id(), data["endpoint"], data["keys"]["p256dh"],
+                                    data["keys"]["auth"])).fetchone()
+                if previous:
+                    try:
+                        prior_id = uuid.UUID(previous)
+                    except (ValueError, TypeError):
+                        fail(400, "invalid previous subscription")
+                    if prior_id != row["id"]:
+                        conn.execute("DELETE FROM push_subscriptions WHERE id=%s", (prior_id,))
+            self.respond(200, {"id": str(row["id"])})
+            return
+        if path == "/push/unsubscribe":
+            data = self.json_body()
+            try:
+                subscription_id = uuid.UUID(data.get("id", ""))
+            except (ValueError, TypeError):
+                fail(400, "invalid subscription")
+            with connect(self.app.dsn) as conn:
+                conn.execute("DELETE FROM push_subscriptions WHERE id=%s", (subscription_id,))
+            self.respond(200, {"disabled": True})
+            return
         form = self.form()
         with connect(self.app.dsn) as conn:
             expire_leases(conn)
@@ -500,7 +678,7 @@ class Handler(BaseHTTPRequestHandler):
                              (run_id, request_id, project["id"], RUN_SECONDS))
                 conn.execute("INSERT INTO contracts(run_id,version,body,proposal) VALUES (%s,1,%s::jsonb,%s::jsonb)",
                              (run_id, canonical(body), canonical(proposal)))
-                event(conn, run_id, "proposal_created", {"contract_version": 1, "request_id": request_id})
+                event(conn, run_id, "proposal_created", {"contract_version": 1, "request_id": request_id}, notify=True)
                 conn.commit()
                 return self.redirect("/runs/" + run_id)
             if path.startswith("/runs/"):
@@ -764,7 +942,8 @@ class Handler(BaseHTTPRequestHandler):
                     conn.execute("UPDATE runs SET status='blocked',stop_reason='deadline',updated_at=now() WHERE id=%s", (row["run_id"],))
                 else:
                     conn.execute("UPDATE runs SET status=%s,updated_at=now() WHERE id=%s", (status, row["run_id"]))
-                event(conn, row["run_id"], "attempt_reconciled", {"attempt_id": attempt_id, "journal_state": state, "status": status})
+                event(conn, row["run_id"], "attempt_reconciled", {"attempt_id": attempt_id, "journal_state": state, "status": status},
+                      notify=status in ("blocked", "uncertain") and row["run_status"] != status)
                 conn.commit()
                 self.respond(200, {"status": attempt_status, "cancel": row["cancel_requested"]})
                 return
@@ -955,7 +1134,9 @@ class Handler(BaseHTTPRequestHandler):
                                "cancelled" if status == "cancelled" else "uncertain" if status == "uncertain" else "failed")
                 conn.execute("UPDATE tasks SET status=%s WHERE id=%s", (task_status, row["task_id"]))
                 conn.execute("UPDATE runs SET status=%s,updated_at=now() WHERE id=%s", (status, row["run_id"]))
-                event(conn, row["run_id"], "attempt_reported", {"attempt_id": attempt_id, "outcome": outcome, "run_status": status})
+                event(conn, row["run_id"], "attempt_reported", {"attempt_id": attempt_id, "outcome": outcome, "run_status": status},
+                      notify=status in ("ready_to_merge", "blocked", "failed", "checks_failed", "uncertain")
+                      and row["run_status"] != status)
                 conn.commit()
                 self.respond(200, {"status": status})
                 return
@@ -1140,6 +1321,17 @@ class App:
         self.worker_id = args.worker_id
         self.worker_token = args.worker_token
         self.origin = args.origin
+        self.stopping = threading.Event()
+        speech_config = getattr(args, "speech_config", None)
+        speech_scratch = getattr(args, "speech_scratch", None)
+        if bool(speech_config) != bool(speech_scratch):
+            raise ValueError("speech configuration and scratch path must be provided together")
+        self.speech = SpeechRunner(speech_config, speech_scratch) if speech_config else None
+        self.vapid_private_key = getattr(args, "vapid_private_key", None)
+        self.vapid_subject = getattr(args, "vapid_subject", None)
+        if bool(self.vapid_private_key) != bool(self.vapid_subject):
+            raise ValueError("VAPID key and subject must be provided together")
+        self.vapid_public_key = vapid_public_key(self.vapid_private_key) if self.vapid_private_key else None
         reviewer_path = getattr(args, "reviewer_config", None)
         self.reviewer = json.loads(Path(reviewer_path).read_text()) if reviewer_path else None
         if not self.reviewer or set(self.reviewer) not in (
@@ -1155,14 +1347,19 @@ class App:
             raise ValueError("invalid server reviewer configuration")
 
     def sweep(self):
-        while True:
+        while not self.stopping.is_set():
             try:
                 with connect(self.dsn) as conn:
                     expire_leases(conn)
                 prepare_reviews(self)
             except (psycopg.Error, OSError, ReviewInputError):
                 pass
-            time.sleep(2)
+            self.stopping.wait(2)
+
+    def stop(self):
+        self.stopping.set()
+        if self.speech:
+            self.speech.stop()
 
 
 def main():
@@ -1185,6 +1382,10 @@ def main():
     serve.add_argument("--worker-token", required=True)
     serve.add_argument("--origin", required=True, help="External HTTPS origin, e.g. https://teem.example")
     serve.add_argument("--reviewer-config", required=True, help="server-owned local review identity and instructions JSON")
+    serve.add_argument("--speech-config", help="server-owned whisper-cli executable, model identity, and language JSON")
+    serve.add_argument("--speech-scratch", help="private temporary directory outside artifacts and backups")
+    serve.add_argument("--vapid-private-key", help="stable server-owned VAPID private key PEM")
+    serve.add_argument("--vapid-subject", help="VAPID contact, e.g. mailto:operator@example.com")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
@@ -1203,7 +1404,12 @@ def main():
         server = ThreadingHTTPServer((args.host, args.port), Handler)
         server.app = App(args)
         threading.Thread(target=server.app.sweep, daemon=True).start()
-        server.serve_forever()
+        if server.app.vapid_public_key:
+            threading.Thread(target=sender_loop, args=(server.app,), daemon=True).start()
+        try:
+            server.serve_forever()
+        finally:
+            server.server_close()
 
 
 if __name__ == "__main__":

@@ -60,7 +60,7 @@ Use ordinary HTTP upload and a synchronous subprocess invocation. Admit one tran
 | Upload | 8 MiB; 30-second upload timeout |
 | Decode and inference | 90 seconds combined; terminate the process group on timeout |
 | Output | 8,000 characters and 32 KiB UTF-8; reject overflow |
-| Resources | One invocation, two CPU threads, 2 GiB memory; validate the installed model fits |
+| Resources | One invocation, 2 GiB memory; use finite subprocess/resource limits appropriate to the host |
 
 Negotiate a supported `MediaRecorder` format and initially accept tested WebM/Opus and MP4/AAC. Validate media rather than trusting MIME or duration claims; reject malformed or overlong input instead of silently truncating. Invoke fixed argument vectors without a shell. Use the existing Bubblewrap approach to restrict the runner to its binaries/model/input and private scratch, with no network, repository/artifact access, or server credentials. Stop child processes on server exit. Details of installation and resource enforcement are implementation work, not a new execution subsystem.
 
