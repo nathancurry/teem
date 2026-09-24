@@ -16,6 +16,7 @@ COPY --from=build /app/.venv /app/.venv
 ENV PATH="/app/.venv/bin:${PATH}"
 WORKDIR /app
 USER 568:568
+EXPOSE 8765
 ENTRYPOINT ["teem-server"]
 
 # Build this target only when local dictation is enabled. The runner and model

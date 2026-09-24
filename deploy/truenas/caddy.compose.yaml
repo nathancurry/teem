@@ -4,6 +4,5 @@ services:
     restart: unless-stopped
     network_mode: host
     volumes:
-      - /mnt/tank/teem/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
-      - /mnt/tank/teem/caddy/data:/data
-      - /mnt/tank/teem/caddy/config:/config
+      - /mnt/storage/teem/caddy-config/Caddyfile:/etc/caddy/Caddyfile:ro
+      - /mnt/storage/teem/caddy-data:/data

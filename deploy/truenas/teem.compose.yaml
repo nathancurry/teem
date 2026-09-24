@@ -7,9 +7,9 @@ services:
       POSTGRES_USER: teem
       POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
     volumes:
-      - /mnt/tank/teem/postgres:/var/lib/postgresql/data
-      - /mnt/tank/teem/config/postgres_password:/run/secrets/postgres_password:ro
-      - /mnt/tank/teem/config/schema.sql:/docker-entrypoint-initdb.d/01-teem.sql:ro
+      - /mnt/storage/teem/postgres:/var/lib/postgresql/data
+      - /mnt/storage/teem/config/postgres_password:/run/secrets/postgres_password:ro
+      - /mnt/storage/teem/config/schema.sql:/docker-entrypoint-initdb.d/01-teem.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U teem -d teem"]
       interval: 10s
@@ -17,15 +17,15 @@ services:
       retries: 10
 
   server:
-    # Build from the repository root: docker build --target server -t teem:0.1.0 .
-    image: teem:0.1.0
-    pull_policy: never
+    # Build from the repository root: docker build --target server -t teem:v0.0.1 .
+    image: ghcr.io/nathancurry/teem:v0.0.1
+    pull_policy: always
     restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
     user: "568:568"
-    env_file: /mnt/tank/teem/config/teem.env
+    env_file: /mnt/storage/teem/config/teem.env
     entrypoint: ["/bin/sh", "-ec"]
     command:
       - >-
@@ -44,5 +44,5 @@ services:
     ports:
       - "127.0.0.1:8765:8765"
     volumes:
-      - /mnt/tank/teem/artifacts:/srv/teem/artifacts
-      - /mnt/tank/teem/config:/srv/teem/config:ro
+      - /mnt/storage/teem/artifacts:/srv/teem/artifacts
+      - /mnt/storage/teem/config:/srv/teem/config:ro
