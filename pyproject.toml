@@ -1,0 +1,14 @@
+[project]
+name = "teem"
+version = "0.1.0"
+description = "A single-user, durable coding run controller and outbound worker"
+requires-python = ">=3.11"
+dependencies = ["psycopg[binary]>=3.2,<4"]
+
+[project.scripts]
+teem-server = "teem.server:main"
+teem-worker = "teem.worker:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

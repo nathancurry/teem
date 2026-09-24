@@ -22,6 +22,8 @@ Status: implementation plan for the smallest end-to-end subset of [v0](v0.md). S
 
 Use current-state tables plus append-only events in the same transaction. Keep the worker protocol limited to the operations above, with version and capability checks; exact payload shapes, transport timing, and artifact backend can be chosen during implementation. The worker journal supports reconciliation but is not an alternate source of authority. Attempts use stable IDs and increasing assignment generations; stale reports cannot complete a Task. On lease loss, stop work and reconcile before a retry. A retry creates a new Attempt and workspace, never overwrites the previous result.
 
+Controller transactions that lock more than one workflow record acquire PostgreSQL row locks in this order: Run, Task, Attempt. Expiration scans use stable ID order and commit before a request locks its target Run. Cancellation, assignment, reporting, and reconciliation use the same order so lock-order deadlocks cannot drop a cancellation decision.
+
 ## Slice acceptance
 
 - From PWA submission through scoped authorization, coding, checks, and Candidate display, every authority transition is recorded; a proposal alone cannot start execution.
