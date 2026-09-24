@@ -1,0 +1,7 @@
+{
+  "executable": "/srv/teem/speech/whisper-cli",
+  "executable_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "model": "/srv/teem/speech/ggml-base.en.bin",
+  "model_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "language": "en"
+}

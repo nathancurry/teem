@@ -1,4 +1,4 @@
-name: Publish server image
+name: Publish images
 
 on:
   push:
@@ -25,3 +25,10 @@ jobs:
           target: server
           push: true
           tags: ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          target: speech
+          push: true
+          tags: ghcr.io/${{ github.repository }}:${{ github.ref_name }}-speech

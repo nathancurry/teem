@@ -1,25 +1,25 @@
 # TrueNAS SCALE deployment
 
-This is a single-host example for a Docker-based TrueNAS SCALE release with **Install via YAML**. Replace `tank`, `teem.example.com`, and all example credentials before pasting the two Compose files into separate apps. The Teem server serves the PWA files from its installed package and runs the push sender in the same process; neither needs another container. Workers and their repositories stay on other machines. No GPU or inference service is part of these YAML files. TrueNAS documents [Install via YAML](https://apps.truenas.com/managing-apps/installing-custom-apps/) as a Docker Compose editor.
+This is a single-host example for a Docker-based TrueNAS SCALE release with **Install via YAML**. Replace `storage`, `teem.example.com`, and all example credentials before pasting the two Compose files into separate apps. The Teem server serves the PWA files from its installed package and runs the push sender in the same process; neither needs another container. Workers and their repositories stay on other machines. No GPU or inference service is part of these YAML files. TrueNAS documents [Install via YAML](https://apps.truenas.com/managing-apps/installing-custom-apps/) as a Docker Compose editor.
 
 ## 1. Host storage and access
 
-Create these paths before installing either app. Use a pool name in place of `tank`, then make the same replacement in both YAML files and `env.example`.
+Create these paths before installing either app. Use your pool name in place of `storage` in the paths below and both Compose files.
 
 | Host path | Container path | Access and owner |
 | --- | --- | --- |
 | `/mnt/storage/teem/postgres` | `/var/lib/postgresql/data` | PostgreSQL image's `postgres` user, private read/write; empty on first boot |
 | `/mnt/storage/teem/artifacts` | `/srv/teem/artifacts` | UID/GID 568, private read/write |
 | `/mnt/storage/teem/config` | `/srv/teem/config` | UID 568 can read; only an administrator can change files |
-| `/mnt/storage/teem/caddy/Caddyfile` | `/etc/caddy/Caddyfile` | Readable by Caddy |
-| `/mnt/storage/teem/caddy/data` | `/data` | Caddy can write; stores ACME certificates |
-| `/mnt/storage/teem/caddy/config` | `/config` | Caddy can write |
+| `/mnt/storage/teem/speech` (voice only) | `/srv/teem/speech` | UID 568 can read; mount read-only |
+| `/mnt/storage/teem/caddy-config/Caddyfile` | `/etc/caddy/Caddyfile` | Readable by Caddy |
+| `/mnt/storage/teem/caddy-data` | `/data` | Caddy can write; stores ACME certificates |
 
 Use private dataset ACLs, not a public share. The PostgreSQL image manages ownership of an empty data directory; confirm its runtime user can write it before starting. Set the artifact dataset's owner to 568:568. Make `teem.env`, `postgres_password`, `vapid.pem`, and `reviewer.json` readable only by their required container user and administrators. A source dataset mounted read-only in the container does not replace host-side ACLs. Keep the PostgreSQL data and artifacts on durable storage with enough free space for 50 MiB candidate bundles and normal PostgreSQL growth.
 
 Put the current [`teem/schema.sql`](../../teem/schema.sql) at `/mnt/storage/teem/config/schema.sql` and copy [`env.example`](env.example) to `/mnt/storage/teem/config/teem.env`. Create `/mnt/storage/teem/config/postgres_password` as a single-line file containing the database password. Put the same password, URL-encoded where needed, into `TEEM_DSN`. The Compose file uses Docker's `POSTGRES_PASSWORD_FILE`; Teem itself receives the DSN as its existing `--dsn` option. `TEEM_*` names in `teem.env` are used by the Compose shell wrapper, not read by Teem as application settings. Keep the env file out of source control. Docker process arguments and container metadata can expose CLI credentials to TrueNAS administrators; restrict host and app management access accordingly.
 
-Create `/mnt/storage/teem/config/reviewer.json` using the server reviewer JSON in the [main README](../../README.md). Its identity, instructions hash, destination, model, and timeout must match worker policy. After building the image below, generate one VAPID private key, then keep that exact key through upgrades and restore it with the secrets:
+Copy [`reviewer.example.json`](reviewer.example.json) to `/mnt/storage/teem/config/reviewer.json`. Its identity, instructions hash, destination, model, and timeout must match the worker policy in the [main README](../../README.md). After building or pulling the image below, generate one VAPID private key, then keep that exact key through upgrades and restore it with the secrets:
 
 ```sh
 docker run --rm --entrypoint python -v /mnt/storage/teem/config:/srv/teem/config ghcr.io/nathancurry/teem:v0.0.1 \
@@ -40,7 +40,7 @@ docker run --rm ghcr.io/nathancurry/teem:v0.0.1 serve --help
 
 The image contains no credentials or deployment data; the Compose file bind-mounts artifacts and read-only configuration.
 
-GitHub Actions publishes the default server target to ghcr.io/nathancurry/teem:vX.Y.Z when a vX.Y.Z tag is pushed. The TrueNAS deployment pins an explicit version tag and uses pull_policy: always so the tagged image is refreshed when the app is deployed or updated. Configure GHCR credentials on TrueNAS only if the package is private.
+GitHub Actions publishes both targets for every `v*` tag: `server` as `ghcr.io/nathancurry/teem:vX.Y.Z` and `speech` as `ghcr.io/nathancurry/teem:vX.Y.Z-speech`. There is no `latest` tag. The TrueNAS deployment pins an explicit version tag and uses `pull_policy: always` so the tagged image is refreshed when the app is deployed or updated. Configure GHCR credentials on TrueNAS only if the package is private.
 
 The Compose example uses teem-server serve and binds its internal listener to 0.0.0.0 only inside the container. Docker publishes port 8765 on the TrueNAS host's 127.0.0.1 only; PostgreSQL has no published port. Keep the server to one replica because the current implementation embeds its sweep and push loops in that process.
 
@@ -48,31 +48,25 @@ The official PostgreSQL image creates database/user `teem` on an **empty** data 
 
 ## 3. HTTPS and startup
 
-Copy [`Caddyfile.example`](Caddyfile.example) to `/mnt/storage/teem/caddy/Caddyfile` and replace its hostname. Set `TEEM_ORIGIN` to exactly `https://` plus that hostname, without a trailing slash. Give the hostname working DNS and certificate issuance reachability. Caddy's host networking needs host TCP ports 80 and 443; move the TrueNAS management UI off those ports first and restrict its new port separately. Install `teem.compose.yaml` as one app, confirm PostgreSQL initialization and Teem startup, then install `caddy.compose.yaml` as a second app. The host-network Caddy container connects to the loopback-only published Teem port. Caddy obtains and renews certificates and persists them under `caddy/data`. See [Caddy automatic HTTPS](https://caddyserver.com/docs/automatic-https) for DNS and challenge requirements.
+Copy [`Caddyfile.example`](Caddyfile.example) to `/mnt/storage/teem/caddy-config/Caddyfile` and replace its hostname. Set `TEEM_ORIGIN` to exactly `https://` plus that hostname, without a trailing slash. Give the hostname working DNS and certificate issuance reachability. Caddy's host networking needs host TCP ports 80 and 443; move the TrueNAS management UI off those ports first and restrict its new port separately. Install `teem.compose.yaml` as one app, confirm PostgreSQL initialization and Teem startup, then install `caddy.compose.yaml` as a second app. The host-network Caddy container connects to the loopback-only published Teem port. Caddy obtains and renews certificates and persists them under `caddy-data`. See [Caddy automatic HTTPS](https://caddyserver.com/docs/automatic-https) for DNS and challenge requirements.
 
 The Caddyfile proxies the whole origin, including `/sw.js` at the root so it can control the PWA. It preserves incoming `Authorization` and `Origin` headers; Teem requires Basic authentication and same-origin browser POSTs, while workers use a bearer token. Teem already returns `Cache-Control: no-store` on its responses, including static assets. Caddy limits `/transcribe` requests to 8 MiB and allows 120 seconds to read the upstream response, covering Teem's 90-second inference bound. Do not put a site-wide 8 MiB limit in front of `/worker/upload/`, which accepts candidate bundles up to 50 MiB. The browser has a 30-second upload timeout. [Caddy's `request_body` directive](https://caddyserver.com/docs/caddyfile/directives/request_body) requires Caddy 2.10 or later.
 
 ## 4. Optional local dictation
 
-The example starts with voice disabled: it passes neither speech option. `/transcribe` then returns 503 after authentication. For voice, explicitly build the Dockerfile's `speech` target, which adds FFmpeg/ffprobe and Bubblewrap, and change the server image in `teem.compose.yaml` to `ghcr.io/nathancurry/teem:v0.0.1-speech`:
+The example starts with voice disabled: it passes neither speech option. `/transcribe` then returns 503 after authentication. For voice, change the server image in [`teem.compose.yaml`](teem.compose.yaml) from `ghcr.io/nathancurry/teem:v0.0.1` to `ghcr.io/nathancurry/teem:v0.0.1-speech` (or the matching `${tag}-speech` for your release). That image adds FFmpeg/ffprobe and Bubblewrap. To build it locally instead of pulling the published image:
 
 ```sh
 docker build --target speech -t ghcr.io/nathancurry/teem:v0.0.1-speech .
 ```
 
-Install a static `whisper-cli` built from whisper.cpp v1.9.4 and the `ggml-base.en.bin` model in the private config dataset, readable by UID 568. Neither is baked into either image. The model SHA-256 is `a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002`; calculate the actual executable SHA-256. Put this JSON in `/mnt/storage/teem/config/speech.json`:
+Install a static `whisper-cli` built from whisper.cpp v1.9.4 and the `ggml-base.en.bin` model in `/mnt/storage/teem/speech/`, readable by UID 568. Neither is baked into either image. Copy [`speech.example.json`](speech.example.json) to `/mnt/storage/teem/config/speech.json`. Calculate SHA-256 for the exact files installed on TrueNAS and replace both all-zero placeholders in `speech.json` with the resulting 64-character hex digests:
 
-```json
-{
-  "executable": "/srv/teem/config/whisper-cli",
-  "executable_sha256": "<SHA-256 of the installed static executable>",
-  "model": "/srv/teem/config/ggml-base.en.bin",
-  "model_sha256": "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002",
-  "language": "en"
-}
+```sh
+sha256sum /mnt/storage/teem/speech/whisper-cli /mnt/storage/teem/speech/ggml-base.en.bin
 ```
 
-Add `--speech-config /srv/teem/config/speech.json --speech-scratch /tmp/teem-speech-scratch` to the server command in `teem.compose.yaml` and redeploy. `/tmp/teem-speech-scratch` is container-local, outside artifact storage and backups; Teem creates it and clears abandoned speech directories at startup. Do not place raw recordings or scratch under artifacts. Verify `/usr/bin/ffmpeg`, `/usr/bin/ffprobe`, `bwrap`, and unprivileged user namespaces work **inside the deployed server container**. Bubblewrap's user namespace setup can be restricted by the host/container security profile; if the sandbox cannot run, leave voice disabled. Test a real 60-second supported clip within the 90-second, 2 GiB process bounds before accepting voice. The server accepts WebM/Opus or MP4/AAC recordings up to 8 MiB and 60 seconds.
+In `teem.compose.yaml`, uncomment the read-only `/mnt/storage/teem/speech:/srv/teem/speech:ro` mount and the private, UID 568 owned tmpfs at `/srv/teem/speech-scratch`. Add `--speech-config /srv/teem/config/speech.json --speech-scratch /srv/teem/speech-scratch` to the server command and redeploy. The scratch tmpfs keeps recordings outside artifacts and backups; Teem clears abandoned speech directories at startup. Verify `/usr/bin/ffmpeg`, `/usr/bin/ffprobe`, `bwrap`, and unprivileged user namespaces work **inside the deployed server container**. Bubblewrap's user namespace setup can be restricted by the host/container security profile; if the sandbox cannot run, leave voice disabled. Test a real 60-second supported clip within the 90-second, 2 GiB process bounds before accepting voice. The server accepts WebM/Opus or MP4/AAC recordings up to 8 MiB and 60 seconds.
 
 ## 5. Workers, checks, and operations
 

@@ -17,7 +17,8 @@ services:
       retries: 10
 
   server:
-    # Build from the repository root: docker build --target server -t teem:v0.0.1 .
+    # Optional voice: change this tag to v0.0.1-speech, then enable the
+    # speech arguments, read-only speech volume, and scratch tmpfs below.
     image: ghcr.io/nathancurry/teem:v0.0.1
     pull_policy: always
     restart: unless-stopped
@@ -27,6 +28,8 @@ services:
     user: "568:568"
     env_file: /mnt/storage/teem/config/teem.env
     entrypoint: ["/bin/sh", "-ec"]
+    # Voice: add --speech-config /srv/teem/config/speech.json and
+    # --speech-scratch /srv/teem/speech-scratch to the command below.
     command:
       - >-
         exec teem-server serve
@@ -46,3 +49,8 @@ services:
     volumes:
       - /mnt/storage/teem/artifacts:/srv/teem/artifacts
       - /mnt/storage/teem/config:/srv/teem/config:ro
+      # Voice: uncomment this mount after putting whisper-cli and the model in the speech dataset.
+      # - /mnt/storage/teem/speech:/srv/teem/speech:ro
+    # Voice: uncomment this UID 568 owned private scratch tmpfs; recordings stay off durable storage.
+    # tmpfs:
+    #   - /srv/teem/speech-scratch:rw,nosuid,nodev,size=512m,uid=568,gid=568,mode=0700
