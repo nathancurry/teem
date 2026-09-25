@@ -369,9 +369,13 @@ class Worker:
             timeout = self.remaining(assignment, CODER_SECONDS)
             mounts = [(workspace, "/workspace", "rw"), (workspace / ".git", "/workspace/.git", "ro"),
                       (contract_file, "/contract.json", "ro")]
+            coder = self.policy["coder"]
+            if contract.get("implementer_model"):
+                # The approved contract's model choice overrides the worker default for this Run.
+                coder = {**coder, "env": {**coder.get("env", {}), "TEEM_CLAUDE_MODEL": contract["implementer_model"]}}
             code, output = restricted_run(
-                container_command(self.policy, "teem-" + attempt_id, attempt_id, self.policy["coder"]["argv"],
-                                  mounts, "/workspace", timeout, self.policy["coder"]),
+                container_command(self.policy, "teem-" + attempt_id, attempt_id, coder["argv"],
+                                  mounts, "/workspace", timeout, coder),
                 attempt_id, timeout, lambda: self.heartbeat(assignment), self.journal)
             if code:
                 raise WorkerError("coder exited " + str(code) + ": " + output[-1000:])

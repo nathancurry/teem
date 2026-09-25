@@ -81,7 +81,7 @@ Follow [worker setup](deploy/worker/README.md) to build the agent and proxy imag
 }
 ```
 
-Create the Claude token with `claude setup-token`. It uses your Claude subscription and shares its usage limits with your interactive use. Log Codex in once with `HOME=/srv/teem/codex-home codex login --device-auth`. The reviewer mounts that directory as its home so Codex can refresh its token. Each role's `env` and `home` reach only that role's containers. Set `TEEM_CLAUDE_MODEL` or `TEEM_CODEX_MODEL` in a role's `env` to pin a model.
+Create the Claude token with `claude setup-token`. It uses your Claude subscription and shares its usage limits with your interactive use. Log Codex in once with `HOME=/srv/teem/codex-home codex login --device-auth`. The reviewer mounts that directory as its home so Codex can refresh its token. Each role's `env` and `home` reach only that role's containers. Set `TEEM_CLAUDE_MODEL` or `TEEM_CODEX_MODEL` in a role's `env` to choose each role's default model. A request can also ask for the implementer model for one Run, such as "use Opus for this"; the contract records `sonnet` or `opus`, the Approve message shows it, and it overrides the worker default for that Run.
 
 ```sh
 teem-worker --url https://teem.example --token "$TEEM_WORKER_TOKEN" --worker-id worker-1 --projects policy.json --state-dir /srv/teem/worker-state

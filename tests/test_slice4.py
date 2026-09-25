@@ -14,6 +14,7 @@ from unittest.mock import patch
 from teem import github, telegram
 from teem.db import connect
 from teem.worker import container_command, restricted_run
+from teem.workflow import create_run
 from tests.test_slice import run
 
 FAKE_CLAUDE = """#!/usr/bin/python3
@@ -22,7 +23,8 @@ from pathlib import Path
 prompt = sys.argv[sys.argv.index('-p') + 1]
 assert '--dangerously-skip-permissions' in sys.argv
 if 'Ask first' in prompt:
-    print(json.dumps({'type': 'result', 'is_error': False, 'result': 'Which file should change?'}))
+    model = sys.argv[sys.argv.index('--model') + 1] if '--model' in sys.argv else 'default'
+    print(json.dumps({'type': 'result', 'is_error': False, 'result': f'Which file should change? ({model})'}))
     sys.exit()
 if 'Reproduction test test_probe.py' in prompt and 'AssertionError: plain after' in prompt:
     value = 'after reviewed'
@@ -324,7 +326,7 @@ class Slice4Acceptance(unittest.TestCase):
     def test_voice_request_waits_for_button_and_reaches_ready(self):
         self.enable_decider()
         proposal = ("propose_run", {"repo": self.project_id.upper(), "objective": "Change value",
-                                    "acceptance_criteria": "value.txt contains after"})
+                                    "acceptance_criteria": "value.txt contains after", "model": "opus"})
         self.model.responses = [("I can set that up.", proposal)]
         voice = {"file_id": "v1", "duration": 1, "file_size": len(self.api.state["voice"])}
         self.deliver(message(300, voice=voice))
@@ -333,6 +335,7 @@ class Slice4Acceptance(unittest.TestCase):
         self.assertEqual(self.texts()[:2], ["Heard: approve change value", "I can set that up."])
         self.assertEqual(self.api.state["sent"][2]["reply_markup"]["inline_keyboard"][0][0]["callback_data"],
                          f"r:{run['id']}:1:a")
+        self.assertIn("model: opus", self.api.state["sent"][2]["text"])
         self.assertEqual(self.model.requests[0]["messages"][-1], {"role": "user", "content": "approve change value"})
         with connect(self.dsn) as conn:
             self.assertEqual(conn.execute("SELECT count(*) FROM approvals WHERE run_id=%s", (run["id"],)).fetchone()["count"], 0)
@@ -467,14 +470,16 @@ class Slice4Acceptance(unittest.TestCase):
 
     def test_implementer_without_changes_asks_the_user(self):
         self.use_agent_wrappers()
-        status, headers, _ = self.browser("POST", "/requests", {"project": self.project_id,
-            "objective": "Ask first", "criteria": "value.txt changes"})
-        self.assertEqual(self.browser("POST", headers["Location"] + "/approve", {"version": "1", "decision": "approve"})[0], 303)
+        base, checks = github.fetch_base(self.server.app, self.project_id)
+        with connect(self.dsn) as conn:
+            run_id, _ = create_run(conn, self.project_id, base, checks, self.reviewer_config,
+                                   "Ask first", "value.txt changes", "ask-first", model="opus")
+        self.assertEqual(self.browser("POST", f"/runs/{run_id}/approve", {"version": "1", "decision": "approve"})[0], 303)
         self.claim_and_execute()
         self.assertIsNone(self.worker.api.call("POST", "/worker/claim", {"worker_id": "worker",
             "capabilities": ["code", "check", "bundle", "review"]})["assignment"])
         self.drain()
-        self.assertIn("Stopped: Test: Ask first\nStop reason: needs_input: Which file should change?", self.texts()[-1])
+        self.assertIn("Stopped: Test: Ask first\nStop reason: needs_input: Which file should change? (opus)", self.texts()[-1])
 
     def test_voice_failures_reply_and_leave_no_audio(self):
         state = self.api.state

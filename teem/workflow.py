@@ -2,7 +2,7 @@
 
 import hashlib
 
-from .common import RUN_SECONDS, STATUS_LABELS, canonical, digest, fail, new_id
+from .common import IMPLEMENTER_MODELS, RUN_SECONDS, STATUS_LABELS, canonical, digest, fail, new_id
 from .db import event
 
 
@@ -12,7 +12,7 @@ def reviewer_identity(config):
             "destination": config["destination"], "timeout": config["timeout"]}
 
 
-def create_run(conn, project_id, base, checks, reviewer, objective, criteria, dedupe_key, revisions=2):
+def create_run(conn, project_id, base, checks, reviewer, objective, criteria, dedupe_key, revisions=2, model=None):
     """Create a proposed Run, or return the Run already created for this deduplication key.
 
     A granted project authorizes the Run in the same transaction; otherwise the Run waits for a
@@ -26,6 +26,8 @@ def create_run(conn, project_id, base, checks, reviewer, objective, criteria, de
         fail(400, "objective and acceptance criteria required")
     if revisions not in (0, 1, 2):
         fail(400, "revision limit must be 0–2")
+    if model is not None and model not in IMPLEMENTER_MODELS:
+        fail(400, "unknown implementer model")
     # FOR SHARE makes a concurrent revocation wait until this Run's authorization is decided.
     project = conn.execute("SELECT * FROM projects WHERE id=%s FOR SHARE", (project_id,)).fetchone()
     if not project:
@@ -37,6 +39,9 @@ def create_run(conn, project_id, base, checks, reviewer, objective, criteria, de
             "check_hash": digest(checks), "reviewer": reviewer_identity(reviewer),
             "limits": {"seconds": RUN_SECONDS, "attempts": 8, "revisions": revisions},
             "delivery_condition": "pull request from a teem/ branch after passing checks and independent passing review"}
+    if model:
+        # Part of the approved scope: a stronger model spends more of the subscription's limits.
+        body["implementer_model"] = model
     proposal = {"repository": project["name"], "base_commit": base,
                 "allowed_actions": body["allowed_actions"], "check_plan": checks,
                 "limits": body["limits"], "delivery_condition": body["delivery_condition"]}

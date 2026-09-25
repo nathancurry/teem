@@ -5,7 +5,7 @@ import urllib.request
 import psycopg
 
 from . import decider, github
-from .common import STATUS_LABELS, ApiError
+from .common import IMPLEMENTER_MODELS, STATUS_LABELS, ApiError
 from .db import connect
 from .speech import MAX_AUDIO, MAX_SECONDS, SpeechError
 from .workflow import cancel_run, create_run, decide_run
@@ -156,12 +156,15 @@ def prepare(app, text):
     objective, criteria = args.get("objective"), args.get("acceptance_criteria")
     if not isinstance(objective, str) or not isinstance(criteria, str) or not objective.strip() or not criteria.strip():
         return replies + ["That proposal was missing an objective or acceptance criteria."], None
+    model = args.get("model")
+    if model is not None and model not in IMPLEMENTER_MODELS:
+        return replies + ["That proposal named an unknown model."], None
     try:
         base, checks = github.fetch_base(app, repo)
     except github.GitHubError as exc:
         return replies + [f"I couldn't read {repo} from GitHub: {exc}"], None
     return replies, {"kind": name, "repo": repo, "base": base, "checks": checks,
-                     "objective": objective.strip(), "criteria": criteria.strip()}
+                     "objective": objective.strip(), "criteria": criteria.strip(), "model": model}
 
 
 def ensure_project(conn, repo):
@@ -194,7 +197,8 @@ def apply_action(conn, app, update_id, action):
         try:
             with conn.transaction():
                 run_id, _ = create_run(conn, action["repo"], action["base"], action["checks"], app.reviewer,
-                                       action["objective"], action["criteria"], f"tg:{update_id}")
+                                       action["objective"], action["criteria"], f"tg:{update_id}",
+                                       model=action["model"])
         except psycopg.errors.UniqueViolation:
             return [f"A run is already active on {action['repo']}."]
         except ApiError as exc:
@@ -309,7 +313,8 @@ def run_update(conn, run_id, origin):
     if run["status"] == "awaiting_approval":
         checks = ", ".join(check["name"] for check in contract["checks"]) or "none (.teem/checks.json not found)"
         text += (f"\nDone when: {contract['acceptance_criteria'][:600]}\nChecks: {checks}"
-                 f"\nBase: {contract['base_commit'][:10]} · up to {contract['limits']['revisions']} revisions")
+                 f"\nBase: {contract['base_commit'][:10]} · up to {contract['limits']['revisions']} revisions"
+                 f" · model: {contract.get('implementer_model', 'default')}")
         prefix = f"r:{run_id}:{run['contract_version']}:"
         buttons = [[{"text": "Approve", "callback_data": prefix + "a"}, {"text": "Deny", "callback_data": prefix + "d"}]]
     return text + f"\n{origin}/runs/{run_id}", buttons

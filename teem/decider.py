@@ -37,7 +37,10 @@ TOOLS = [
                        "required": ["repo", "objective", "acceptance_criteria"],
                        "properties": {"repo": {"type": "string", "description": "owner/name"},
                                       "objective": {"type": "string"},
-                                      "acceptance_criteria": {"type": "string"}}}}},
+                                      "acceptance_criteria": {"type": "string"},
+                                      "model": {"type": "string", "enum": ["sonnet", "opus"],
+                                                "description": "Implementer model. Set only when the user asks "
+                                                               "for one; omit for the default."}}}}},
     {"type": "function", "function": {
         "name": "propose_project",
         "description": "Ask the user to allow Teem to work on a repository without per-run approval.",

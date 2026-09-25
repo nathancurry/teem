@@ -13,6 +13,8 @@ MAX_OUTPUT_BYTES = 64 * 1024
 MAX_REVIEW_INPUT_BYTES = 1024 * 1024
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 REPO_RE = re.compile(r"^[a-z0-9][a-z0-9-]*/[a-z0-9._-]+$")
+# Claude Code model aliases a request may choose; None uses the worker default.
+IMPLEMENTER_MODELS = ("sonnet", "opus")
 
 STATUS_LABELS = {"awaiting_approval": "Decision required", "queued": "Queued",
                  "coding": "Coding and checks", "awaiting_review": "Awaiting review",
