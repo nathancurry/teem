@@ -40,11 +40,12 @@ from pathlib import Path
 args = sys.argv
 assert args[1] == 'exec' and args[args.index('-C') + 1] == '/workspace'
 schema = json.loads(Path(args[args.index('--output-schema') + 1]).read_text())
-criterion = schema['properties']['findings']['items']['properties']['criterion']['enum'][1]
+numbers = schema['properties']['findings']['items']['properties']['criterion_number']['enum']
+assert all(type(n) is int for n in numbers), 'criteria are chosen by number, never quoted text'
 value = Path('/workspace/value.txt').read_text()
 if value == 'after\\n':
     judgment = {'verdict': 'changes_required', 'summary': 'Value is not reviewed', 'uncertainties': [],
-                'findings': [{'criterion': criterion, 'description': 'value.txt must say reviewed',
+                'findings': [{'criterion_number': numbers[1], 'description': 'value.txt must say reviewed',
                               'evidence': [{'kind': 'source', 'path': 'value.txt', 'start_line': 1, 'end_line': 1,
                                             'check_name': None}],
                               'reproduction': {'path': 'test_probe.py', 'content': 'assert False',
@@ -439,8 +440,12 @@ class Slice4Acceptance(unittest.TestCase):
 
     def test_agent_wrappers_revise_on_failed_checks_and_review(self):
         self.use_agent_wrappers()
-        run_path = self.propose(revisions=2)
-        run_id = run_path.split("/")[-1]
+        # Quoted examples in criteria are common and must survive the reviewer's strict output schema.
+        status, headers, _ = self.browser("POST", "/requests", {"project": self.project_id,
+            "objective": "Change value", "criteria": 'value.txt starts with "after"', "revisions": "2"})
+        run_id = headers["Location"].split("/")[-1]
+        self.assertEqual(self.browser("POST", headers["Location"] + "/approve",
+                                      {"version": "1", "decision": "approve"})[0], 303)
         for _ in range(5):
             self.claim_and_execute()
         with connect(self.dsn) as conn:
