@@ -71,9 +71,9 @@ Worker-local policy remains an intersection. `projects.json` becomes a list of a
 Replace Bubblewrap coder, check, and review sandboxes with one rootless Podman container per subprocess. The container is named after its Attempt, so a restarted worker can check with `podman ps` whether the process still exists. Its mounts and access:
 
 - The workspace is the only read-write bind mount. The contract and context files are mounted read-only.
-- It connects to an internal network whose only exit is an allowlisting forward proxy container, stock tinyproxy with default-deny. The allowlist covers the model API hosts for the two CLIs and the package registries the projects need. It excludes github.com write paths.
+- It connects to an internal network with DNS disabled. The only other member is an allowlisting forward proxy container (stock tinyproxy with default-deny), reached by a fixed IP; the proxy resolves names on its own outside network. Without DNS, the agent can't exfiltrate data through DNS queries either. The allowlist covers the model API hosts for the two CLIs and the package registries the projects need. It excludes github.com.
 - It receives the model credential its role needs and no other secrets. The GitHub tokens never enter any container.
-- CPU, memory, PID, and wall-clock limits are enforced by Podman. Timeouts use `podman kill`.
+- CPU, memory, PID, and wall-clock limits are enforced by Podman. Timeouts stop the client and remove the container. A container is labeled with its Attempt and outlives a crashed worker only until its Podman `--timeout`; a restarted worker removes it before reconciling that Attempt.
 
 The agent can still read and misuse its own model credential, and it can exfiltrate data to allowlisted hosts. That is accepted for one user on a dedicated worker. The container is not a VM, so do not run it on the TrueNAS host. Build the agent image from `deploy/worker/agent.Containerfile` with pinned CLI and toolchain versions.
 

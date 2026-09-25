@@ -4,7 +4,7 @@ import hashlib
 import http.client
 import json
 import os
-import resource
+import shutil
 import signal
 import socket
 import sqlite3
@@ -100,33 +100,30 @@ def git(*args, cwd=None, env=None, timeout=30):
     return result.stdout.strip()
 
 
-def sandbox_command(argv, workspace, contract_file):
-    workspace = Path(workspace).resolve()
-    contract_file = Path(contract_file).resolve()
-    command = ["bwrap", "--unshare-all", "--new-session", "--die-with-parent",
-               "--ro-bind", "/usr", "/usr", "--ro-bind", "/bin", "/bin",
-               "--ro-bind", "/lib", "/lib", "--ro-bind", "/lib64", "/lib64",
-               "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
-               "--bind", str(workspace), "/workspace",
-               "--ro-bind", str(workspace / ".git"), "/workspace/.git",
-               "--ro-bind", str(contract_file), "/contract.json",
-               "--chdir", "/workspace", "--setenv", "HOME", "/tmp",
-               "--setenv", "PATH", "/usr/bin:/bin", "--setenv", "TEEM_CONTRACT", "/contract.json",
-               "--", "/bin/bash", "-c", "ulimit -u 64 && ulimit -H -u 64 && exec \"$@\"", "teem-exec"]
-    return command + argv
+def podman_env():
+    # Rootless Podman needs the user's runtime directory; containers get only explicit --env values.
+    return {key: os.environ[key] for key in ("PATH", "HOME", "XDG_RUNTIME_DIR", "USER") if key in os.environ}
 
 
-def review_command(executable, scratch, context_file):
-    return ["bwrap", "--unshare-all", "--new-session", "--die-with-parent",
-            "--ro-bind", "/usr", "/usr", "--ro-bind", "/bin", "/bin",
-            "--ro-bind", "/lib", "/lib", "--ro-bind", "/lib64", "/lib64",
-            "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
-            "--bind", str(Path(scratch).resolve()), "/scratch",
-            "--ro-bind", str(Path(context_file).resolve()), "/context.json",
-            "--ro-bind", str(Path(executable).resolve()), "/runner",
-            "--chdir", "/scratch", "--setenv", "HOME", "/tmp",
-            "--setenv", "PATH", "/usr/bin:/bin", "--", "/bin/bash", "-c",
-            "ulimit -u 64 && ulimit -H -u 64 && exec /runner"]
+def container_command(policy, name, attempt_id, argv, mounts, workdir, timeout):
+    """One disposable container whose only network path is the allowlisting proxy."""
+    command = ["podman", "run", "--rm", "--name", name, "--label", "teem.attempt=" + attempt_id,
+               "--userns=keep-id", "--read-only", "--tmpfs", "/tmp:rw,exec,size=2g",
+               "--pids-limit", "512", "--memory", "6g", "--cpus", "4",
+               # Bounds a container orphaned by a crashed worker until the next worker start removes it.
+               "--timeout", str(int(timeout) + 60),
+               "--network", policy["network"], "--workdir", workdir,
+               "--env", "HOME=/tmp", "--env", "HTTPS_PROXY=" + policy["proxy"],
+               "--env", "HTTP_PROXY=" + policy["proxy"], "--env", "NO_PROXY=localhost,127.0.0.1",
+               "--env", "TEEM_CONTRACT=/contract.json"]
+    for source, target, mode in mounts:
+        command += ["-v", f"{Path(source).resolve()}:{target}:{mode},z"]
+    return command + [policy["image"], *argv]
+
+
+def remove_containers(attempt_id):
+    subprocess.run(["podman", "rm", "--force", "--time", "0", "--filter", "label=teem.attempt=" + attempt_id],
+                   env=podman_env(), capture_output=True, timeout=60)
 
 
 def ollama_bridge(scratch, context, model, timeout):
@@ -198,21 +195,9 @@ def ollama_bridge(scratch, context, model, timeout):
     return stop
 
 
-def limits():
-    resource.setrlimit(resource.RLIMIT_CPU, (CODER_SECONDS + 10, CODER_SECONDS + 10))
-    resource.setrlimit(resource.RLIMIT_AS, (2 * 1024**3, 2 * 1024**3))
-    resource.setrlimit(resource.RLIMIT_FSIZE, (64 * 1024**2, 64 * 1024**2))
-    # Bubblewrap needs a higher limit while creating namespaces; the shell inside lowers it before coder code runs.
-    resource.setrlimit(resource.RLIMIT_NPROC, (1024, 1024))
-    resource.setrlimit(resource.RLIMIT_NOFILE, (256, 256))
-    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-    os.setsid()
-
-
-def restricted_run(argv, workspace, contract_file, timeout, heartbeat, journal=None, attempt_id=None, command=None):
-    process = subprocess.Popen(command or sandbox_command(argv, workspace, contract_file),
-                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                               env={"PATH": "/usr/bin:/bin"}, preexec_fn=limits)
+def restricted_run(command, attempt_id, timeout, heartbeat, journal=None):
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               env=podman_env(), start_new_session=True)
     reader_started = False
     try:
         output = bytearray()
@@ -244,10 +229,13 @@ def restricted_run(argv, workspace, contract_file, timeout, heartbeat, journal=N
             time.sleep(0.2)
     finally:
         if process.poll() is None:
+            # Stop the client first so it cannot create the container after removal runs.
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+            process.wait()
+            remove_containers(attempt_id)
         process.wait()
         if reader_started:
             done.wait(timeout=2)
@@ -270,9 +258,14 @@ class Worker:
             finally:
                 os.close(fd)
         self.policy = json.loads(Path(args.projects).read_text())
-        if not isinstance(self.policy, dict) or not {"owners", "coder", "reviewer"} <= set(self.policy) or \
-           not set(self.policy) <= {"owners", "coder", "reviewer", "git_base", "token"}:
-            raise WorkerError("worker policy needs owners, coder, and reviewer, with optional git_base and token")
+        required = {"owners", "coder", "reviewer", "image", "network", "proxy"}
+        if not isinstance(self.policy, dict) or not required <= set(self.policy) or \
+           not set(self.policy) <= required | {"git_base", "token"}:
+            raise WorkerError("worker policy needs owners, coder, reviewer, image, network, and proxy, "
+                              "with optional git_base and token")
+        if any(not isinstance(self.policy[key], str) or not self.policy[key] for key in ("image", "network", "proxy")) or \
+           not self.policy["proxy"].startswith("http://"):
+            raise WorkerError("image, network, and an http:// proxy URL are required")
         if not isinstance(self.policy["owners"], list) or not self.policy["owners"] or \
            any(not isinstance(o, str) or not REPO_RE.fullmatch(o + "/x") for o in self.policy["owners"]):
             raise WorkerError("owners must be lowercase GitHub owner names")
@@ -330,16 +323,10 @@ class Worker:
 
     def reconcile(self):
         for attempt_id, generation, assignment_json, state, workspace, pid, result_json in self.journal.pending():
-            if state == "executing" and pid:
-                # A restarted worker cannot settle the attempt while the old sandbox process may still be alive.
-                try:
-                    os.kill(pid, 0)
-                except ProcessLookupError:
-                    pass
-                except PermissionError:
-                    continue
-                else:
-                    continue
+            if state in ("preparing", "executing"):
+                # Execution is single-threaded, so an unfinished attempt here belongs to a previous
+                # worker process. Its containers outlived it; stop them before reconciling.
+                remove_containers(attempt_id)
             assignment = json.loads(assignment_json)
             result = json.loads(result_json) if result_json else None
             if result and result["outcome"] == "candidate":
@@ -431,9 +418,13 @@ class Worker:
             contract_file.write_text(canonical(coding_input))
             with contract_file.open("rb") as f:
                 os.fsync(f.fileno())
-            code, output = restricted_run(self.policy["coder"], workspace, contract_file,
-                                          self.remaining(assignment, CODER_SECONDS),
-                                          lambda: self.heartbeat(assignment), self.journal, attempt_id)
+            timeout = self.remaining(assignment, CODER_SECONDS)
+            mounts = [(workspace, "/workspace", "rw"), (workspace / ".git", "/workspace/.git", "ro"),
+                      (contract_file, "/contract.json", "ro")]
+            code, output = restricted_run(
+                container_command(self.policy, "teem-" + attempt_id, attempt_id, self.policy["coder"],
+                                  mounts, "/workspace", timeout),
+                attempt_id, timeout, lambda: self.heartbeat(assignment), self.journal)
             if code:
                 raise WorkerError("coder exited " + str(code) + ": " + output[-1000:])
             ensure_lease()
@@ -466,9 +457,13 @@ class Worker:
                 ensure_lease()
                 git("checkout", "--detach", head, cwd=check_workspace)
                 ensure_lease()
-                code, output = restricted_run(check["argv"], check_workspace, contract_file,
-                                              self.remaining(assignment, CHECK_SECONDS),
-                                              lambda: self.heartbeat(assignment))
+                timeout = self.remaining(assignment, CHECK_SECONDS)
+                mounts = [(check_workspace, "/workspace", "rw"), (check_workspace / ".git", "/workspace/.git", "ro"),
+                          (contract_file, "/contract.json", "ro")]
+                code, output = restricted_run(
+                    container_command(self.policy, f"teem-{attempt_id}-check{index}", attempt_id, check["argv"],
+                                      mounts, "/workspace", timeout),
+                    attempt_id, timeout, lambda: self.heartbeat(assignment))
                 results.append({"name": check["name"], "argv": check["argv"],
                                 "exit_code": code, "output": output})
                 if git("rev-parse", "HEAD", cwd=workspace) != head:
@@ -523,11 +518,17 @@ class Worker:
             if reviewer["destination"] == "local-ollama":
                 stop_bridge = ollama_bridge(scratch, context, reviewer["model"],
                                             self.remaining(assignment, reviewer["timeout"]))
+            # A private copy keeps the installed executable's file label and contents untouched.
+            runner = self.state_dir / (attempt_id + ".runner")
+            shutil.copyfile(reviewer["executable"], runner)
+            runner.chmod(0o500)
+            timeout = self.remaining(assignment, reviewer["timeout"])
+            mounts = [(scratch, "/scratch", "rw"), (context_file, "/context.json", "ro"), (runner, "/runner", "ro")]
             try:
-                code, output = restricted_run([], scratch, context_file,
-                                              self.remaining(assignment, reviewer["timeout"]),
-                                              lambda: self.heartbeat(assignment), self.journal, attempt_id,
-                                              command=review_command(reviewer["executable"], scratch, context_file))
+                code, output = restricted_run(
+                    container_command(self.policy, "teem-" + attempt_id, attempt_id, ["/runner"],
+                                      mounts, "/scratch", timeout),
+                    attempt_id, timeout, lambda: self.heartbeat(assignment), self.journal)
             finally:
                 if stop_bridge:
                     stop_bridge()

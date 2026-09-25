@@ -1,0 +1,8 @@
+^api\.anthropic\.com$
+^statsig\.anthropic\.com$
+^chatgpt\.com$
+^api\.openai\.com$
+^auth\.openai\.com$
+^registry\.npmjs\.org$
+^pypi\.org$
+^files\.pythonhosted\.org$

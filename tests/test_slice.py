@@ -23,7 +23,34 @@ from psycopg.conninfo import make_conninfo
 
 from teem.db import connect, initialize
 from teem.server import App, Handler, ThreadingHTTPServer
-from teem.worker import Worker, WorkerError, restricted_run
+from teem.worker import Worker, WorkerError, container_command, restricted_run
+
+AGENT_IMAGE = os.environ.get("TEEM_TEST_AGENT_IMAGE", "localhost/teem-agent:dev")
+PROXY_IMAGE = "localhost/teem-proxy:dev"
+DEPLOY = Path(__file__).resolve().parent.parent / "deploy" / "worker"
+
+
+def podman(*argv, check=True):
+    return subprocess.run(["podman", *argv], check=check, capture_output=True, text=True).stdout.strip()
+
+
+def start_agent_network(allowlist):
+    """An internal network whose only exit is a fresh allowlisting proxy, as deployed on a worker."""
+    for image, containerfile in ((AGENT_IMAGE, "agent.Containerfile"), (PROXY_IMAGE, "proxy.Containerfile")):
+        if subprocess.run(["podman", "image", "exists", image]).returncode:
+            podman("build", "-q", "-t", image, "-f", str(DEPLOY / containerfile), str(DEPLOY))
+    suffix = os.urandom(3)
+    name = "teem-test-" + suffix.hex()
+    subnet = f"10.{200 + suffix[0] % 50}.{suffix[1]}"
+    podman("network", "create", "--internal", "--disable-dns", "--subnet", subnet + ".0/24", name)
+    podman("run", "-d", "--rm", "--name", name + "-proxy", "--network", "podman",
+           "--network", f"{name}:ip={subnet}.2", "-v", f"{allowlist}:/etc/tinyproxy/allow:ro,z", PROXY_IMAGE)
+    return name, f"http://{subnet}.2:8888"
+
+
+def stop_agent_network(name):
+    podman("rm", "--force", "--time", "0", name + "-proxy", check=False)
+    podman("network", "rm", "--force", name, check=False)
 
 
 def run(*argv, cwd=None):
@@ -41,11 +68,16 @@ class SliceAcceptance(unittest.TestCase):
             conn.execute(f'CREATE DATABASE "{cls.dbname}"')
         cls.dsn = make_conninfo(cls.admin_dsn, dbname=cls.dbname)
         initialize(cls.dsn)
+        cls.allowlist = Path(tempfile.mkdtemp()) / "allow"
+        cls.allowlist.write_text("^example\\.com$\n")
+        cls.agent_network, cls.agent_proxy = start_agent_network(cls.allowlist)
 
     @classmethod
     def tearDownClass(cls):
         if not hasattr(cls, "dbname"):
             return
+        stop_agent_network(cls.agent_network)
+        shutil.rmtree(cls.allowlist.parent, ignore_errors=True)
         with psycopg.connect(cls.admin_dsn, autocommit=True) as conn:
             conn.execute(f'DROP DATABASE "{cls.dbname}" WITH (FORCE)')
 
@@ -98,7 +130,8 @@ class SliceAcceptance(unittest.TestCase):
         with connect(self.dsn) as conn:
             conn.execute("INSERT INTO projects(id,name,status) VALUES (%s,'Test','proposed')", (self.project_id,))
         policy = {"owners": ["teem-test"], "coder": ["/usr/bin/python3", "/workspace/coder.py"],
-                  "reviewer": reviewer_policy, "git_base": str(self.git_base)}
+                  "reviewer": reviewer_policy, "git_base": str(self.git_base), "image": AGENT_IMAGE,
+                  "network": self.agent_network, "proxy": self.agent_proxy}
         config = self.root / "projects.json"
         config.write_text(json.dumps(policy))
         self.github_file = self.root / "github.json"
@@ -366,32 +399,22 @@ class SliceAcceptance(unittest.TestCase):
                 time.sleep(0.05)
             else:
                 self.fail("coder did not start")
-            attempt_id, process_group, _ = row
+            attempt_id = row[0]
             first.kill()
             first.communicate(timeout=5)
 
-            def old_process_running():
-                for entry in Path("/proc").iterdir():
-                    if not entry.name.isdigit():
-                        continue
-                    try:
-                        fields = (entry / "stat").read_text().rsplit(") ", 1)[1].split()
-                    except OSError:
-                        continue
-                    if int(fields[2]) == process_group and fields[0] != "Z":
-                        return True
-                return False
+            def containers():
+                return podman("ps", "-a", "-q", "--filter", "label=teem.attempt=" + attempt_id)
 
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline and old_process_running():
-                time.sleep(0.05)
-            self.assertFalse(old_process_running(), "old coder process group survived worker death")
+            # A container outlives its crashed worker (bounded by its Podman timeout).
+            self.assertTrue(containers())
 
             with connect(self.dsn) as conn:
                 conn.execute("UPDATE attempts SET lease_until=now()-interval '1 second' WHERE id=%s", (attempt_id,))
             self.assertIn(b"uncertain", self.browser("GET", path)[2])
-            restarted = subprocess.run(command, capture_output=True, timeout=10)
+            restarted = subprocess.run(command, capture_output=True, timeout=30)
             self.assertEqual(restarted.returncode, 0, restarted.stderr.decode(errors="replace"))
+            self.assertEqual(containers(), "", "restarted worker left the orphaned coder running")
             with connect(self.dsn) as conn:
                 attempt = conn.execute("SELECT status FROM attempts WHERE id=%s", (attempt_id,)).fetchone()
                 self.assertEqual(attempt["status"], "reconciled_uncertain")
@@ -413,14 +436,15 @@ class SliceAcceptance(unittest.TestCase):
                 raise OSError("journal unavailable")
 
         journal = RejectJournal()
-        contract = self.root / "contract.json"
-        contract.write_text("{}")
+        attempt = "journal-" + os.urandom(4).hex()
+        command = container_command(self.worker.policy, "teem-" + attempt, attempt,
+                                    ["/usr/bin/python3", "-c", "import time; time.sleep(30)"], [], "/tmp", 30)
         with self.assertRaises(OSError):
-            restricted_run(["/usr/bin/python3", "-c", "import time; time.sleep(30)"],
-                           self.repo, contract, 30, lambda: None, journal, "test-attempt")
+            restricted_run(command, attempt, 30, lambda: None, journal)
         self.assertIsNotNone(journal.pid)
         with self.assertRaises(ProcessLookupError):
             os.killpg(journal.pid, 0)
+        self.assertEqual(podman("ps", "-a", "-q", "--filter", "label=teem.attempt=" + attempt), "")
 
     def test_transport_loss_during_coding_is_uncertain(self):
         coder = self.repo / "coder.py"

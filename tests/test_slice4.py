@@ -6,8 +6,12 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer as HTTPServer
 
+from unittest.mock import patch
+import os
+
 from teem import telegram
 from teem.db import connect
+from teem.worker import container_command, restricted_run
 from tests import test_slice as slice1
 from tests import test_slice3 as slice3
 
@@ -280,6 +284,35 @@ class Slice4Acceptance(unittest.TestCase):
                                                "Queued for approval."])
         self.assertTrue(self.texts()[-1].startswith("Decision required:"))
         self.assertEqual(self.run_row()["status"], "awaiting_approval")
+
+    def test_agent_container_reaches_only_the_proxy(self):
+        probe = (
+            "import os, socket\n"
+            "print(os.environ.get('TEEM_HOST_SECRET', 'no host env'))\n"
+            "host, port = os.environ['HTTPS_PROXY'].removeprefix('http://').split(':')\n"
+            "for target in ('github.com', '192.168.1.1'):\n"
+            "    s = socket.create_connection((host, int(port)), timeout=5)\n"
+            "    s.sendall(f'CONNECT {target}:443 HTTP/1.1\\r\\nHost: {target}:443\\r\\n\\r\\n'.encode())\n"
+            "    print(s.recv(100).split(b'\\r\\n')[0].decode())\n"
+            "for address in (('1.1.1.1', 443), ('192.168.1.1', 80)):\n"
+            "    try:\n"
+            "        socket.create_connection(address, timeout=2)\n"
+            "        print('direct open')\n"
+            "    except OSError:\n"
+            "        print('direct blocked')\n"
+            "try:\n"
+            "    socket.getaddrinfo('example.com', 443)\n"
+            "    print('dns open')\n"
+            "except OSError:\n"
+            "    print('dns blocked')\n")
+        attempt = "probe-" + os.urandom(4).hex()
+        command = container_command(self.worker.policy, "teem-" + attempt, attempt,
+                                    ["/usr/bin/python3", "-c", probe], [], "/tmp", 30)
+        with patch.dict(os.environ, {"TEEM_HOST_SECRET": "leaked"}):
+            code, output = restricted_run(command, attempt, 30, lambda: None)
+        self.assertEqual(code, 0, output)
+        self.assertEqual(output.split("\n")[:6], ["no host env", "HTTP/1.1 403 Filtered", "HTTP/1.1 403 Filtered",
+                                                  "direct blocked", "direct blocked", "dns blocked"])
 
 
 if __name__ == "__main__":

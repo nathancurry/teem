@@ -1,10 +1,10 @@
 # Teem (slice 4 in progress)
 
-Teem runs one authorized coding Task on a GitHub repository, objective checks, and an independent read-only review. A valid review can request up to two bounded revisions. Passing checks and a fresh passing review of the preserved Candidate produce **Ready to merge**. A Telegram bot is the main interface: voice notes and text go to a model-backed decider, which proposes Runs through validated tools. Work starts only after an Approve button tap or under a standing project grant the user created with an Allow button. The phone PWA remains for evidence pages. Merge and deployment remain outside Teem. See [slice 4](docs/architecture/vertical-slice-4.md); steps 1–2 (Telegram channel, decider, grants) are implemented, and the real coding agents, container sandbox, and pull requests are not yet.
+Teem runs one authorized coding Task on a GitHub repository, objective checks, and an independent read-only review. A valid review can request up to two bounded revisions. Passing checks and a fresh passing review of the preserved Candidate produce **Ready to merge**. A Telegram bot is the main interface: voice notes and text go to a model-backed decider, which proposes Runs through validated tools. Work starts only after an Approve button tap or under a standing project grant the user created with an Allow button. The phone PWA remains for evidence pages. Merge and deployment remain outside Teem. See [slice 4](docs/architecture/vertical-slice-4.md); steps 1–3 (Telegram channel, decider, grants, container sandbox) are implemented; the real coding agents and pull requests are not yet.
 
 ## Requirements
 
-- Python 3.11+, PostgreSQL, Git, Bash, and Bubblewrap on the worker.
+- Python 3.11+ and PostgreSQL on the server. Python 3.11+, Git, and rootless Podman on the worker; see [worker setup](deploy/worker/README.md) for the agent image, internal network, and allowlisting proxy.
 - Projects are GitHub repositories under configured owners. The server and worker each keep their own mirror clone. Coder and check commands run in isolated workspaces. The reviewer executable must be installed on the worker.
 - Durable server artifact storage and worker state storage. Back up artifacts with PostgreSQL. HTTPS termination in front of the loopback server is required for worker connections.
 - FFmpeg/ffprobe, Bubblewrap, and a static `whisper-cli` built from [whisper.cpp v1.9.4](https://github.com/ggml-org/whisper.cpp/releases/tag/v1.9.4). Install the [`ggml-base.en.bin` model](https://github.com/ggml-org/whisper.cpp#quick-start) outside the repository. Its SHA-256 is `a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002`. The server verifies both the model and runner executable hashes at startup. A static binary avoids mounting extra runner libraries into the speech sandbox.
@@ -60,12 +60,15 @@ The server reviewer configuration fixes the runner identity, instructions, local
 {"identity":"local-ollama/qwen2.5-coder:14b-32k","instructions":"Review the supplied Candidate against its original acceptance criteria.","destination":"local-ollama","model":"qwen2.5-coder:14b-32k","timeout":600}
 ```
 
-Install `teem/reviewer_ollama.py` as an executable on the worker, such as `/srv/teem/bin/reviewer-ollama`. The worker policy file lists the GitHub owners the worker accepts and its coder and reviewer commands. The worker verifies that each contract's checks match `.teem/checks.json` at the contract's base in its own mirror. `instructions_sha256` is the SHA-256 of the exact UTF-8 instructions above. The reviewer executable reads `/context.json` and writes one JSON judgment to standard output. It runs with a fresh read-only context, disposable scratch, no repository mount, and no network. A one-use Unix socket in that scratch connects only to the worker's fixed `127.0.0.1:11434` Ollama endpoint; the worker supplies the frozen model and context.
+Install `teem/reviewer_ollama.py` as an executable on the worker, such as `/srv/teem/bin/reviewer-ollama`. The worker policy file lists the GitHub owners the worker accepts and its coder and reviewer commands. The worker verifies that each contract's checks match `.teem/checks.json` at the contract's base in its own mirror. `instructions_sha256` is the SHA-256 of the exact UTF-8 instructions above. The reviewer executable reads `/context.json` and writes one JSON judgment to standard output. It runs in a container with a fresh read-only context, disposable scratch, and no repository mount; its only network path is the allowlisting proxy. A one-use Unix socket in that scratch connects only to the worker's fixed `127.0.0.1:11434` Ollama endpoint; the worker supplies the frozen model and context.
 
 ```json
 {
   "owners": ["your-github-user"],
   "token": "<optional read-only token for private repositories>",
+  "image": "localhost/teem-agent:1",
+  "network": "teem-agents",
+  "proxy": "http://10.203.7.2:8888",
   "coder": ["/usr/bin/python3", "/workspace/coder.py"],
   "reviewer": {
     "identity": "local-ollama/qwen2.5-coder:14b-32k",
@@ -93,7 +96,7 @@ Limits are a 30-minute Run deadline from approval, eight Attempts across the Run
 
 Telegram: pass `--telegram-config telegram.json` containing `{"token": "<bot token>", "user_id": <numeric user id>}`. The server long-polls the Bot API, stores each accepted update before confirming it, echoes transcribed voice notes, and passes the text to the decider. Decisions arrive as Approve/Deny and Allow/Deny buttons composed from current state, so a late message never offers a decision already made. Typed `/revoke owner/name` removes a standing grant; commands are never taken from transcripts. Updates from any other user or chat are recorded only as ignored IDs. Apply [slice-4.sql](docs/architecture/slice-4.sql) once to an existing slice-3 database. Voice notes use the same local runner, now bounded to 120-second clips and 180 seconds of decode and inference; confirm that bound on the server CPU with the chosen model.
 
-Run the PostgreSQL and Bubblewrap acceptance suite with a disposable database admin connection:
+Run the acceptance suite with a disposable database admin connection. It needs rootless Podman; it builds `localhost/teem-agent:dev` and `localhost/teem-proxy:dev` if missing (override the agent image with `TEEM_TEST_AGENT_IMAGE`) and creates a temporary internal network and proxy per test class. The server's speech runner still uses Bubblewrap:
 
 ```sh
 TEEM_TEST_DSN=postgresql://postgres:password@127.0.0.1:5432/postgres python -m unittest -v tests.test_slice
