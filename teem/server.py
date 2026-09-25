@@ -23,6 +23,7 @@ from .common import (
     COMMIT_RE,
     LEASE_SECONDS,
     MAX_ARTIFACT_BYTES,
+    MAX_OUTPUT_BYTES,
     PROTOCOL,
     STATUS_LABELS,
     canonical,
@@ -716,13 +717,18 @@ class Handler(BaseHTTPRequestHandler):
                                              FROM reviews v JOIN attempts a ON a.id=v.attempt_id
                                              JOIN tasks t ON t.id=a.task_id WHERE v.attempt_id=%s""",
                                           (task["source_review_attempt_id"],)).fetchone()
+                    # A revision answers either an accepted changes_required review or the parent's failed checks.
+                    if task["source_review_attempt_id"]:
+                        cause_valid = bool(source and source["disposition"] == "accepted" and
+                                           parent and source["input_candidate_id"] == parent["id"] and
+                                           source["revision_number"] == task["revision_number"] - 1 and
+                                           source["result"]["verdict"] == "changes_required")
+                    else:
+                        cause_valid = bool(parent and any(check["exit_code"] != 0 for check in parent["evidence"]["checks"]))
                     if not parent or parent["run_id"] != task["run_id"] or parent["contract_version"] != task["contract_version"] or \
                        parent["producing_kind"] != "code_and_check" or \
                        parent["producing_round"] != task["revision_number"] - 1 or \
-                       parent["id"] != task["current_candidate_id"] or not source or source["disposition"] != "accepted" or \
-                       source["input_candidate_id"] != parent["id"] or \
-                       source["revision_number"] != task["revision_number"] - 1 or \
-                       source["result"]["verdict"] != "changes_required":
+                       parent["id"] != task["current_candidate_id"] or not cause_valid:
                         conn.execute("UPDATE tasks SET status='failed' WHERE id=%s", (task["id"],))
                         stop_run(conn, task["run_id"], "integrity_failure")
                         conn.commit()
@@ -974,11 +980,28 @@ class Handler(BaseHTTPRequestHandler):
                 if outcome == "failed" and data.get("failure_kind") == "policy":
                     status = "blocked"
                     conn.execute("UPDATE runs SET stop_reason='integrity_failure' WHERE id=%s", (row["run_id"],))
+                elif outcome == "failed" and data.get("failure_kind") == "needs_input" and row["kind"] == "code_and_check":
+                    # The implementer made no change and explained why; that is a question for the user, not a retry.
+                    status = "blocked"
+                    question = str((data.get("usage") or {}).get("error", ""))[:500]
+                    conn.execute("UPDATE runs SET stop_reason=%s WHERE id=%s", ("needs_input: " + question, row["run_id"]))
                 if outcome == "candidate":
                     candidate_id = self.save_candidate(conn, row, data)
                     checks = data["evidence"]["checks"]
                     conn.execute("UPDATE runs SET current_candidate_id=%s WHERE id=%s", (candidate_id, row["run_id"]))
-                    if any(item["exit_code"] != 0 for item in checks):
+                    contract = row["body"]
+                    if not any(item["exit_code"] != 0 for item in checks):
+                        pass
+                    elif row["revision_number"] < contract["limits"]["revisions"] and \
+                            attempt_count(conn, row["run_id"]) < contract["limits"]["attempts"]:
+                        conn.execute("""INSERT INTO tasks(id,run_id,kind,status,revision_number,input_candidate_id)
+                                        VALUES (%s,%s,'code_and_check','queued',%s,%s)""",
+                                     (new_id(), row["run_id"], row["revision_number"] + 1, candidate_id))
+                        status = "queued"
+                        event(conn, row["run_id"], "revision_queued", {"parent_candidate_id": candidate_id,
+                                                                        "round": row["revision_number"] + 1,
+                                                                        "reason": "checks_failed"})
+                    else:
                         status = "checks_failed"
                 elif outcome == "review":
                     review, error = self.save_review(conn, row, data, "accepted")
@@ -1119,8 +1142,8 @@ class Handler(BaseHTTPRequestHandler):
         raw_bytes = raw.encode()
         if error is not None and (not isinstance(error, str) or not error.strip()):
             error = "invalid review execution diagnostic"
-        if len(raw_bytes) > 16 * 1024:
-            raw = raw_bytes[:16 * 1024].decode(errors="ignore")
+        if len(raw_bytes) > MAX_OUTPUT_BYTES:
+            raw = raw_bytes[:MAX_OUTPUT_BYTES].decode(errors="ignore")
             error = "review output exceeds cap"
         result = None
         if not error:
@@ -1247,16 +1270,12 @@ class App:
             self.telegram_token, self.telegram_user_id = config["token"], config["user_id"]
         reviewer_path = getattr(args, "reviewer_config", None)
         self.reviewer = json.loads(Path(reviewer_path).read_text()) if reviewer_path else None
-        if not self.reviewer or set(self.reviewer) not in (
-            {"identity", "instructions", "destination", "timeout"},
-            {"identity", "instructions", "destination", "timeout", "model"}) or \
+        if not self.reviewer or set(self.reviewer) != {"identity", "instructions", "destination", "timeout"} or \
            not isinstance(self.reviewer["identity"], str) or not self.reviewer["identity"] or \
            not isinstance(self.reviewer["instructions"], str) or not self.reviewer["instructions"] or \
-           self.reviewer["destination"] not in ("local", "local-ollama") or \
-           (self.reviewer["destination"] == "local-ollama") != ("model" in self.reviewer) or \
-           ("model" in self.reviewer and (not isinstance(self.reviewer["model"], str) or not self.reviewer["model"])) or \
+           self.reviewer["destination"] not in ("local", "openai") or \
            type(self.reviewer["timeout"]) is not int or \
-           not 1 <= self.reviewer["timeout"] <= 900:
+           not 1 <= self.reviewer["timeout"] <= 1800:
             raise ValueError("invalid server reviewer configuration")
 
     def sweep(self):

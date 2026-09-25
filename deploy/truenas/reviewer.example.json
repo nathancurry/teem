@@ -1,7 +1,1 @@
-{
-  "identity": "local-ollama/qwen2.5-coder:14b-32k",
-  "instructions": "Review the supplied Candidate against its original acceptance criteria.",
-  "destination": "local-ollama",
-  "model": "qwen2.5-coder:14b-32k",
-  "timeout": 600
-}
+{"identity": "openai-codex", "instructions": "Review the Candidate strictly against its original acceptance criteria.", "destination": "openai", "timeout": 1200}

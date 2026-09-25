@@ -25,9 +25,13 @@ from teem.db import connect, initialize
 from teem.server import App, Handler, ThreadingHTTPServer
 from teem.worker import Worker, WorkerError, container_command, restricted_run
 
-AGENT_IMAGE = os.environ.get("TEEM_TEST_AGENT_IMAGE", "localhost/teem-agent:dev")
-PROXY_IMAGE = "localhost/teem-proxy:dev"
 DEPLOY = Path(__file__).resolve().parent.parent / "deploy" / "worker"
+# Tag test images by their inputs so an edited Containerfile or wrapper is rebuilt, not reused.
+IMAGE_TAG = hashlib.sha256(b"".join((DEPLOY / name).read_bytes() for name in
+                                    ("agent.Containerfile", "teem-implement", "proxy.Containerfile",
+                                     "tinyproxy.conf"))).hexdigest()[:12]
+AGENT_IMAGE = os.environ.get("TEEM_TEST_AGENT_IMAGE", "localhost/teem-agent:test-" + IMAGE_TAG)
+PROXY_IMAGE = "localhost/teem-proxy:test-" + IMAGE_TAG
 
 
 def podman(*argv, check=True):
@@ -129,7 +133,7 @@ class SliceAcceptance(unittest.TestCase):
                            "destination": "local", "timeout": 30, "executable": str(self.reviewer)}
         with connect(self.dsn) as conn:
             conn.execute("INSERT INTO projects(id,name,status) VALUES (%s,'Test','proposed')", (self.project_id,))
-        policy = {"owners": ["teem-test"], "coder": ["/usr/bin/python3", "/workspace/coder.py"],
+        policy = {"owners": ["teem-test"], "coder": {"argv": ["/usr/bin/python3", "/workspace/coder.py"]},
                   "reviewer": reviewer_policy, "git_base": str(self.git_base), "image": AGENT_IMAGE,
                   "network": self.agent_network, "proxy": self.agent_proxy}
         config = self.root / "projects.json"
@@ -299,8 +303,9 @@ class SliceAcceptance(unittest.TestCase):
         self.checks = [{"name": "failing check", "argv": ["/usr/bin/false"]}]
         (self.repo / ".teem" / "checks.json").write_text(json.dumps(self.checks))
         run("git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qam", "failing check", cwd=self.repo)
+        # With no revision budget, failing checks stop the Run instead of queueing a revision.
         status, headers, _ = self.browser("POST", "/requests", {"project": self.project_id,
-            "objective": "Change value", "criteria": "value.txt contains after"})
+            "objective": "Change value", "criteria": "value.txt contains after", "revisions": "0"})
         self.assertEqual(status, 303)
         path = headers["Location"]
         self.assertEqual(self.browser("POST", path + "/approve", {"version": "1", "decision": "approve"})[0], 303)
@@ -891,11 +896,11 @@ class SliceAcceptance(unittest.TestCase):
             "context=json.loads(Path('/context.json').read_text())\n"
             "pack=context['pack']\n"
             "assert 'accepted_review' not in context and 'source_review' not in context\n"
-            "assert not Path('/workspace').exists()\n"
+            "assert Path('/workspace/.git').is_dir()\n"
             "try: Path('/context.json').write_text('changed')\n"
             "except OSError: pass\n"
             "else: raise AssertionError('review input writable')\n"
-            "value=pack['sources']['value.txt']['lines'][0]\n"
+            "value=Path('/workspace/value.txt').read_text().splitlines()[0]\n"
             "needs_change=value=='after'\n"
             "finding={'criterion':pack['acceptance_criteria'],'description':'Use reviewed value',"
             "'evidence':[{'kind':'source','path':'value.txt','start_line':1,'end_line':1}]}\n"
@@ -989,41 +994,12 @@ class SliceAcceptance(unittest.TestCase):
         self.assertEqual(replacement["task_id"], review["task_id"])
         self.assertIn(b"Ready to merge", self.browser("GET", path)[2])
 
-    @unittest.skipUnless(os.environ.get("TEEM_OLLAMA_SMOKE_MODEL"), "set TEEM_OLLAMA_SMOKE_MODEL for real local reviewer")
-    def test_real_ollama_review_smoke(self):
-        model = os.environ["TEEM_OLLAMA_SMOKE_MODEL"]
-        installed = self.root / "installed-ollama-reviewer"
-        shutil.copy2(Path(__file__).parents[1] / "teem" / "reviewer_ollama.py", installed)
-        installed.chmod(0o755)
-        self.reviewer_config.update({"identity": "local-ollama/" + model, "destination": "local-ollama",
-                                     "model": model, "timeout": 600})
-        self.reviewer_file.write_text(json.dumps(self.reviewer_config))
-        self.server.app.reviewer = self.reviewer_config
-        self.worker.policy["reviewer"].update(
-            {"identity": self.reviewer_config["identity"], "destination": "local-ollama",
-             "model": model, "timeout": 600, "executable": str(installed)})
-        status, headers, _ = self.browser("POST", "/requests", {"project": self.project_id,
-            "objective": "Set value.txt to after", "criteria": "value.txt contains exactly after followed by a newline",
-            "revisions": "0"})
-        self.assertEqual(status, 303)
-        path = headers["Location"]
-        self.assertEqual(self.browser("POST", path + "/approve", {"version": "1", "decision": "approve"})[0], 303)
-        self.claim_and_execute()
-        review = self.claim_and_execute()
-        with connect(self.dsn) as conn:
-            evidence = conn.execute("SELECT disposition,result,validation_error FROM reviews WHERE attempt_id=%s",
-                                    (review["attempt_id"],)).fetchone()
-            self.assertEqual(evidence["disposition"], "accepted", evidence["validation_error"])
-            self.assertIn(evidence["result"]["verdict"], ("pass", "changes_required", "blocked"))
-
     def test_review_input_overflow_blocks_without_dispatch(self):
-        (self.repo / "large.txt").write_text("x" * (2 * 1024 * 1024 + 1))
-        run("git", "add", "large.txt", cwd=self.repo)
-        run("git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "large base", cwd=self.repo)
-        path = self.propose()
-        self.claim_and_execute()
-        self.assertIsNone(self.worker.api.call("POST", "/worker/claim", {"worker_id": "worker",
-            "capabilities": ["code", "check", "bundle", "review"]})["assignment"])
+        with patch("teem.review.MAX_REVIEW_INPUT_BYTES", 600):
+            path = self.propose()
+            self.claim_and_execute()
+            self.assertIsNone(self.worker.api.call("POST", "/worker/claim", {"worker_id": "worker",
+                "capabilities": ["code", "check", "bundle", "review"]})["assignment"])
         self.assertIn(b"review_input_unavailable", self.browser("GET", path)[2])
 
     def test_blocked_review_and_revision_cap_preserve_evidence(self):
@@ -1065,7 +1041,7 @@ class SliceAcceptance(unittest.TestCase):
         self.reviewer.write_text(
             "#!/usr/bin/python3\nimport json,socket\nfrom pathlib import Path\n"
             "context=json.loads(Path('/context.json').read_text())\npack=context['pack']\n"
-            "assert not Path('/workspace').exists()\n"
+            "assert Path('/workspace/.git').is_dir()\n"
             "assert not Path('/secret-worker-token').exists()\n"
             "try: Path('/context.json').write_text('changed')\n"
             "except OSError: pass\n"
@@ -1201,7 +1177,7 @@ class SliceAcceptance(unittest.TestCase):
         run("git", "add", "coder.py", cwd=self.repo)
         run("git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "failed check revision", cwd=self.repo)
         self.reviewer_verdict("changes_required")
-        path = self.propose()
+        path = self.propose(revisions=1)
         self.claim_and_execute()
         self.claim_and_execute()
         revision = self.claim_and_execute()

@@ -7,12 +7,9 @@ from .db import event
 
 
 def reviewer_identity(config):
-    result = {"identity": config["identity"],
-              "instructions_sha256": hashlib.sha256(config["instructions"].encode()).hexdigest(),
-              "destination": config["destination"], "timeout": config["timeout"]}
-    if config["destination"] == "local-ollama":
-        result["model"] = config["model"]
-    return result
+    return {"identity": config["identity"],
+            "instructions_sha256": hashlib.sha256(config["instructions"].encode()).hexdigest(),
+            "destination": config["destination"], "timeout": config["timeout"]}
 
 
 def create_run(conn, project_id, base, checks, reviewer, objective, criteria, dedupe_key, revisions=2):

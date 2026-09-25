@@ -95,9 +95,9 @@ Checks run in the agent image with the proxy and no model credentials. **Failing
 
 ### Adversary
 
-Run Codex non-interactively against the ChatGPT subscription credential, with its final output constrained to the existing review JSON schema. It works in a disposable writable clone of the Candidate with no model context from the implementer. Its input is the same fresh review context as slice 2: contract, Candidate source, and check evidence. It may run tests and write probe tests.
+Run Codex non-interactively against the ChatGPT subscription credential, with its final output constrained to the existing review JSON schema. It works in a disposable writable clone of the Candidate with no model context from the implementer. Its input is a fresh review context: objective, criteria, diff, check evidence, and a line-count index of the Candidate's text files, against which source references are validated. The adversary reads source from its checkout; the context no longer embeds file contents, which would not fit real repositories. It may run tests and write probe tests.
 
-Its changes are discarded, but a finding may attach one bounded reproduction as evidence: a test file up to 16 KiB and its output. The next revision receives that reproduction. Existing review validation, stale-review rules, and verdict semantics are unchanged. Remove the Ollama bridge and `reviewer_ollama.py`.
+Its changes are discarded, but a finding may attach one bounded reproduction as evidence: a test file up to 8,000 characters and up to 2,000 characters of its output. The next revision receives that reproduction. Existing review validation, stale-review rules, and verdict semantics are unchanged. The Ollama bridge and `reviewer_ollama.py` are removed.
 
 ### Limits
 

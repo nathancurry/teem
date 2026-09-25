@@ -6,12 +6,52 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer as HTTPServer
 
-from unittest.mock import patch
 import os
+from pathlib import Path
+from unittest.mock import patch
 
 from teem import telegram
 from teem.db import connect
 from teem.worker import container_command, restricted_run
+from tests.test_slice import run
+
+FAKE_CLAUDE = """#!/usr/bin/python3
+import json, sys
+from pathlib import Path
+prompt = sys.argv[sys.argv.index('-p') + 1]
+assert '--dangerously-skip-permissions' in sys.argv
+if 'Ask first' in prompt:
+    print(json.dumps({'type': 'result', 'is_error': False, 'result': 'Which file should change?'}))
+    sys.exit()
+if 'Reproduction test test_probe.py' in prompt and 'AssertionError: plain after' in prompt:
+    value = 'after reviewed'
+elif \"Check 'content' failed\" in prompt:
+    value = 'after'
+else:
+    value = 'wrong'
+Path('value.txt').write_text(value + '\\n')
+print(json.dumps({'type': 'result', 'is_error': False, 'result': 'Set value.txt to ' + value}))
+"""
+
+FAKE_CODEX = """#!/usr/bin/python3
+import json, sys
+from pathlib import Path
+args = sys.argv
+assert args[1] == 'exec' and args[args.index('-C') + 1] == '/workspace'
+schema = json.loads(Path(args[args.index('--output-schema') + 1]).read_text())
+criterion = schema['properties']['findings']['items']['properties']['criterion']['enum'][1]
+value = Path('/workspace/value.txt').read_text()
+if value == 'after\\n':
+    judgment = {'verdict': 'changes_required', 'summary': 'Value is not reviewed', 'uncertainties': [],
+                'findings': [{'criterion': criterion, 'description': 'value.txt must say reviewed',
+                              'evidence': [{'kind': 'source', 'path': 'value.txt', 'start_line': 1, 'end_line': 1,
+                                            'check_name': None}],
+                              'reproduction': {'path': 'test_probe.py', 'content': 'assert False',
+                                               'output': 'AssertionError: plain after'}}]}
+else:
+    judgment = {'verdict': 'pass', 'summary': 'Reviewed value present', 'findings': [], 'uncertainties': []}
+Path(args[args.index('-o') + 1]).write_text(json.dumps(judgment))
+"""
 from tests import test_slice as slice1
 from tests import test_slice3 as slice3
 
@@ -93,6 +133,7 @@ class Slice4Acceptance(unittest.TestCase):
     stop_server = slice1.SliceAcceptance.stop_server
     browser = slice1.SliceAcceptance.browser
     claim_and_execute = slice1.SliceAcceptance.claim_and_execute
+    propose = slice1.SliceAcceptance.propose
     set_runner = slice3.Slice3Acceptance.set_runner
 
     def setUp(self):
@@ -313,6 +354,54 @@ class Slice4Acceptance(unittest.TestCase):
         self.assertEqual(code, 0, output)
         self.assertEqual(output.split("\n")[:6], ["no host env", "HTTP/1.1 403 Filtered", "HTTP/1.1 403 Filtered",
                                                   "direct blocked", "direct blocked", "dns blocked"])
+
+    def use_agent_wrappers(self):
+        fakebin = self.repo / "fakebin"
+        fakebin.mkdir()
+        for name, program in (("claude", FAKE_CLAUDE), ("codex", FAKE_CODEX)):
+            (fakebin / name).write_text(program)
+            (fakebin / name).chmod(0o755)
+        (self.repo / "check.py").write_text("from pathlib import Path\nassert Path('value.txt').read_text().startswith('after')\n")
+        run("git", "add", ".", cwd=self.repo)
+        run("git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "fake agents", cwd=self.repo)
+        path = {"PATH": "/workspace/fakebin:/usr/local/bin:/usr/bin:/bin"}
+        self.worker.policy["coder"] = {"argv": ["teem-implement"], "env": path}
+        self.worker.policy["reviewer"].update(
+            executable=str(Path(__file__).resolve().parent.parent / "teem" / "reviewer_codex.py"), env=path)
+
+    def test_agent_wrappers_revise_on_failed_checks_and_review(self):
+        self.use_agent_wrappers()
+        run_path = self.propose(revisions=2)
+        run_id = run_path.split("/")[-1]
+        for _ in range(5):
+            self.claim_and_execute()
+        with connect(self.dsn) as conn:
+            self.assertEqual(conn.execute("SELECT status FROM runs WHERE id=%s", (run_id,)).fetchone()["status"],
+                             "ready_to_merge")
+            reasons = [row["payload"].get("reason") for row in conn.execute(
+                "SELECT payload FROM events WHERE run_id=%s AND kind='revision_queued' ORDER BY id", (run_id,))]
+            self.assertEqual(reasons, ["checks_failed", None])
+            reviews = conn.execute("""SELECT v.result FROM reviews v JOIN attempts a ON a.id=v.attempt_id
+                                      JOIN tasks t ON t.id=a.task_id WHERE t.run_id=%s ORDER BY v.created_at""",
+                                   (run_id,)).fetchall()
+            self.assertEqual([r["result"]["verdict"] for r in reviews], ["changes_required", "pass"])
+            self.assertEqual(reviews[0]["result"]["findings"][0]["reproduction"]["path"], "test_probe.py")
+            summaries = [row["usage"]["summary"] for row in conn.execute(
+                """SELECT a.usage FROM attempts a JOIN tasks t ON t.id=a.task_id
+                   WHERE t.run_id=%s AND t.kind='code_and_check' ORDER BY t.revision_number""", (run_id,))]
+            self.assertEqual(summaries, ["Set value.txt to wrong", "Set value.txt to after",
+                                         "Set value.txt to after reviewed"])
+
+    def test_implementer_without_changes_asks_the_user(self):
+        self.use_agent_wrappers()
+        status, headers, _ = self.browser("POST", "/requests", {"project": self.project_id,
+            "objective": "Ask first", "criteria": "value.txt changes"})
+        self.assertEqual(self.browser("POST", headers["Location"] + "/approve", {"version": "1", "decision": "approve"})[0], 303)
+        self.claim_and_execute()
+        self.assertIsNone(self.worker.api.call("POST", "/worker/claim", {"worker_id": "worker",
+            "capabilities": ["code", "check", "bundle", "review"]})["assignment"])
+        self.drain()
+        self.assertIn("Stopped: Test: Ask first\nStop reason: needs_input: Which file should change?", self.texts()[-1])
 
 
 if __name__ == "__main__":

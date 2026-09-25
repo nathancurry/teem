@@ -8,3 +8,4 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 RUN npm install -g @anthropic-ai/claude-code@2.1.282 @openai/codex@0.157.0 \
     && npm cache clean --force
+COPY teem-implement /usr/local/bin/teem-implement

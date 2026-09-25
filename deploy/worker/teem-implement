@@ -1,0 +1,82 @@
+#!/usr/bin/python3
+"""Implementer: runs Claude Code headless on /workspace for the contract in /contract.json.
+
+Prints the agent's final summary on success. Making no changes is how the agent asks a question;
+the worker turns that into a stopped Run with this output as the question.
+"""
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+
+def revision_notes(contract):
+    notes = ["This is a revision. The previous attempt's changes are already applied in /workspace."]
+    failed = [c for c in (contract.get("parent_check_evidence") or {}).get("checks", []) if c["exit_code"] != 0]
+    for check in failed:
+        notes.append(f"Check '{check['name']}' failed with exit code {check['exit_code']}. Output tail:\n"
+                     + check.get("output", "")[-3000:])
+    review = contract.get("accepted_review")
+    if review:
+        notes.append("An independent reviewer requires these changes:")
+        for finding in review["findings"]:
+            refs = ", ".join(f"{r['path']}:{r['start_line']}-{r['end_line']}" if r["kind"] == "source"
+                             else f"check {r['name']}" for r in finding["evidence"])
+            notes.append(f"- [{finding['criterion']}] {finding['description']} (evidence: {refs})")
+            reproduction = finding.get("reproduction")
+            if reproduction:
+                notes.append(f"  Reproduction test {reproduction['path']}:\n{reproduction['content']}\n"
+                             f"  Its output:\n{reproduction['output']}")
+    return "\n\n".join(notes)
+
+
+def prompt(contract):
+    checks = "\n".join(f"- {c['name']}: {' '.join(c['argv'])}" for c in contract["checks"]) or \
+        "None are configured. Verify your change as the project's conventions allow."
+    parts = [
+        "You are the implementer in an automated coding pipeline. The repository is checked out in "
+        "/workspace. Work only there.",
+        "Objective:\n" + contract["objective"],
+        "Acceptance criteria:\n" + contract["acceptance_criteria"],
+        "Objective checks that must pass, run from /workspace:\n" + checks,
+    ]
+    if contract.get("parent_candidate_id"):
+        parts.append(revision_notes(contract))
+    parts.append(
+        "Rules:\n"
+        "- Make the smallest change that fully meets the objective and every acceptance criterion. "
+        "Follow the repository's existing style and conventions.\n"
+        "- Run the checks before finishing and fix any failures you caused.\n"
+        "- Do not commit, create branches, or modify .git; the pipeline commits your working tree.\n"
+        "- Do not modify .teem/checks.json.\n"
+        "- Network access is limited to package registries and model APIs.\n"
+        "- If the request is ambiguous or cannot be done, make no changes and reply with one short "
+        "question saying what you need.\n"
+        "- Finish with a short plain-text summary of what you changed and how you verified it.")
+    return "\n\n".join(parts)
+
+
+def main():
+    contract = json.loads(Path("/contract.json").read_text())
+    command = ["claude", "-p", prompt(contract), "--dangerously-skip-permissions",
+               "--output-format", "json", "--no-session-persistence"]
+    if os.environ.get("TEEM_CLAUDE_MODEL"):
+        command += ["--model", os.environ["TEEM_CLAUDE_MODEL"]]
+    env = {**os.environ, "DISABLE_AUTOUPDATER": "1", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"}
+    result = subprocess.run(command, cwd="/workspace", env=env, capture_output=True, text=True)
+    try:
+        data = json.loads(result.stdout)
+    except ValueError:
+        sys.stderr.write("claude returned no result: " + (result.stderr or result.stdout)[-2000:] + "\n")
+        return 1
+    if result.returncode or data.get("is_error"):
+        sys.stderr.write("claude failed: " + str(data.get("result") or result.stderr)[-2000:] + "\n")
+        return 1
+    print(str(data.get("result", "")).strip())
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
