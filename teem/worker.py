@@ -310,7 +310,7 @@ class Worker:
             return
         contract = assignment["contract"]
         if contract["project_id"] != project_id or \
-           contract["allowed_actions"] != ["code", "check", "review", "revise"] or \
+           contract["allowed_actions"] != ["code", "check", "review", "revise", "publish_pr"] or \
            {k: v for k, v in self.policy["reviewer"].items() if k not in ("executable", "env", "home")} != contract["reviewer"]:
             self.report_failure(assignment, "worker-local policy does not allow assignment", policy=True)
             return

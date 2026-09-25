@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import psycopg
@@ -16,11 +17,9 @@ def initialize(dsn):
 def event(conn, run_id, kind, payload, notify=False):
     row = conn.execute(
         "INSERT INTO events(run_id, kind, payload) VALUES (%s, %s, %s::jsonb) RETURNING id",
-        (run_id, kind, __import__("json").dumps(payload)),
+        (run_id, kind, json.dumps(payload)),
     ).fetchone()
     if notify:
-        conn.execute("""INSERT INTO notification_deliveries(event_id,subscription_id,state)
-                        SELECT %s,id,'pending' FROM push_subscriptions""", (row["id"],))
         # The sender composes the text from current Run state when it sends.
         conn.execute("INSERT INTO telegram_outbox(run_id,state) VALUES (%s,'pending')", (run_id,))
     return row["id"]

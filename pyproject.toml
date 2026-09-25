@@ -5,7 +5,6 @@ description = "A single-user, durable coding run controller and outbound worker"
 requires-python = ">=3.11"
 dependencies = [
     "psycopg[binary]>=3.2,<4",
-    "pywebpush==2.5.0",
 ]
 
 [project.scripts]

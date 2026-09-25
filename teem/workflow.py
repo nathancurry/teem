@@ -33,10 +33,10 @@ def create_run(conn, project_id, base, checks, reviewer, objective, criteria, de
     request_id, run_id = new_id(), new_id()
     body = {"objective": objective, "acceptance_criteria": criteria, "project_id": project_id,
             "base_commit": base, "context_version": 1,
-            "allowed_actions": ["code", "check", "review", "revise"], "checks": checks,
+            "allowed_actions": ["code", "check", "review", "revise", "publish_pr"], "checks": checks,
             "check_hash": digest(checks), "reviewer": reviewer_identity(reviewer),
             "limits": {"seconds": RUN_SECONDS, "attempts": 8, "revisions": revisions},
-            "delivery_condition": "ready_to_merge after passing checks and independent passing review"}
+            "delivery_condition": "pull request from a teem/ branch after passing checks and independent passing review"}
     proposal = {"repository": project["name"], "base_commit": base,
                 "allowed_actions": body["allowed_actions"], "check_plan": checks,
                 "limits": body["limits"], "delivery_condition": body["delivery_condition"]}
@@ -80,6 +80,13 @@ def decide_run(conn, run_id, version, decision, source):
     return run
 
 
+def stop_run(conn, run_id, reason, kind="blocked"):
+    prior = conn.execute("SELECT status FROM runs WHERE id=%s", (run_id,)).fetchone()["status"]
+    conn.execute("UPDATE runs SET status=%s,stop_reason=%s,updated_at=now() WHERE id=%s", (kind, reason, run_id))
+    event(conn, run_id, "run_stopped", {"status": kind, "reason": reason},
+          notify=prior != kind and kind in ("blocked", "failed", "checks_failed", "uncertain"))
+
+
 def cancel_run(conn, run_id):
     run = conn.execute("SELECT * FROM runs WHERE id=%s FOR UPDATE", (run_id,)).fetchone()
     if not run:
@@ -96,7 +103,7 @@ def cancel_run(conn, run_id):
 
 
 def status_rows(conn, run_id=None):
-    rows = conn.execute("""SELECT r.id,r.project_id,p.name AS project_name,r.status,r.stop_reason,
+    rows = conn.execute("""SELECT r.id,r.project_id,p.name AS project_name,r.status,r.stop_reason,r.pr_url,
                           r.updated_at,c.body,r.current_candidate_id,
                           COALESCE((SELECT max(t.revision_number) FROM tasks t WHERE t.run_id=r.id
                                     AND t.kind='code_and_check'),0) AS round
@@ -122,5 +129,6 @@ def status_rows(conn, run_id=None):
                        "objective": row["body"]["objective"], "status": row["status"],
                        "label": STATUS_LABELS.get(row["status"], row["status"]),
                        "round": row["round"], "summary": summary,
-                       "stop_reason": row["stop_reason"], "updated_at": row["updated_at"].isoformat()})
+                       "stop_reason": row["stop_reason"], "pr_url": row["pr_url"],
+                       "updated_at": row["updated_at"].isoformat()})
     return result

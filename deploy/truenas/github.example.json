@@ -1,1 +1,1 @@
-{"owners": ["your-github-user"], "token": "replace-with-fine-grained-token-or-remove-for-public-repos"}
+{"owners": ["your-github-user"], "token": "replace-with-fine-grained-token-contents-and-pull-requests-read-write"}

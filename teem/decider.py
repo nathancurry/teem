@@ -80,7 +80,7 @@ def history(conn):
 
 def current_state(conn, owners):
     projects = conn.execute("SELECT id,status FROM projects ORDER BY id").fetchall()
-    runs = [{key: run[key] for key in ("id", "project", "objective", "label", "summary", "stop_reason", "updated_at")}
+    runs = [{key: run[key] for key in ("id", "project", "objective", "label", "summary", "stop_reason", "pr_url", "updated_at")}
             for run in status_rows(conn)[:15]]
     return {"allowed_owners": owners,
             "projects": [{"repo": p["id"], "allowed_without_asking": p["status"] == "granted"} for p in projects],

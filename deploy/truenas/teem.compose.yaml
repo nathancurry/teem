@@ -41,8 +41,6 @@ services:
         --worker-token "$$TEEM_WORKER_TOKEN"
         --origin "$$TEEM_ORIGIN"
         --reviewer-config /srv/teem/config/reviewer.json
-        --vapid-private-key /srv/teem/config/vapid.pem
-        --vapid-subject "$$TEEM_VAPID_SUBJECT"
         --github-config /srv/teem/config/github.json
         --decider-config /srv/teem/config/decider.json
         --telegram-config /srv/teem/config/telegram.json

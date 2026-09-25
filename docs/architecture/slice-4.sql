@@ -8,6 +8,13 @@ ALTER TABLE projects ALTER COLUMN status DROP DEFAULT;
 ALTER TABLE projects ADD COLUMN decided_at timestamptz;
 ALTER TABLE projects DROP COLUMN base_commit, DROP COLUMN checks, DROP COLUMN check_hash;
 
+ALTER TABLE runs ADD COLUMN pr_url text, ADD COLUMN publish_attempts integer NOT NULL DEFAULT 0,
+    ADD COLUMN next_publish_at timestamptz;
+
+-- Telegram replaces Web Push.
+DROP TABLE notification_deliveries;
+DROP TABLE push_subscriptions;
+
 CREATE TABLE IF NOT EXISTS telegram_updates (
     update_id bigint PRIMARY KEY,
     kind text NOT NULL CHECK (kind IN ('text','voice','callback','unsupported','ignored')),

@@ -1,5 +1,6 @@
 """Slice-4 acceptance paths against real HTTP, PostgreSQL, FFmpeg, Bubblewrap, and a fake Bot API."""
 
+import hashlib
 import json
 import subprocess
 import threading
@@ -10,7 +11,7 @@ import os
 from pathlib import Path
 from unittest.mock import patch
 
-from teem import telegram
+from teem import github, telegram
 from teem.db import connect
 from teem.worker import container_command, restricted_run
 from tests.test_slice import run
@@ -52,8 +53,8 @@ else:
     judgment = {'verdict': 'pass', 'summary': 'Reviewed value present', 'findings': [], 'uncertainties': []}
 Path(args[args.index('-o') + 1]).write_text(json.dumps(judgment))
 """
+from teem.server import App, Handler, ThreadingHTTPServer
 from tests import test_slice as slice1
-from tests import test_slice3 as slice3
 
 USER = 4242
 
@@ -121,6 +122,34 @@ class FakeModel(BaseHTTPRequestHandler):
         pass
 
 
+class FakeGitHub(BaseHTTPRequestHandler):
+    def do_GET(self):
+        head = self.path.split("head=", 1)[1].split("&", 1)[0].replace("%3A", ":").replace("%2F", "/")
+        self.reply(200, [pr for pr in self.server.pulls if pr["head"] == head])
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        assert self.headers["Authorization"] == "Bearer test-token"
+        if self.server.fail_posts:
+            self.server.fail_posts -= 1
+            return self.reply(502, {})
+        owner = self.path.split("/")[2]
+        pr = {**body, "head": owner + ":" + body["head"],
+              "html_url": f"https://github.test/{owner}/pull/{len(self.server.pulls) + 1}"}
+        self.server.pulls.append(pr)
+        self.reply(201, pr)
+
+    def reply(self, status, body):
+        data = json.dumps(body).encode()
+        self.send_response(status)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, *_):
+        pass
+
+
 def callback(update_id, data, sender=USER):
     return {"update_id": update_id, "callback_query": {"id": f"cb{update_id}", "from": {"id": sender},
                                                        "message": {"chat": {"id": sender}}, "data": data}}
@@ -134,7 +163,6 @@ class Slice4Acceptance(unittest.TestCase):
     browser = slice1.SliceAcceptance.browser
     claim_and_execute = slice1.SliceAcceptance.claim_and_execute
     propose = slice1.SliceAcceptance.propose
-    set_runner = slice3.Slice3Acceptance.set_runner
 
     def setUp(self):
         self.api = HTTPServer(("127.0.0.1", 0), FakeTelegram)
@@ -151,19 +179,58 @@ class Slice4Acceptance(unittest.TestCase):
         self.addCleanup(self.model.server_close)
         self.addCleanup(self.model.shutdown)
         self.use_decider = False
+        self.github_api = HTTPServer(("127.0.0.1", 0), FakeGitHub)
+        self.github_api.pulls, self.github_api.fail_posts = [], 0
+        threading.Thread(target=self.github_api.serve_forever, daemon=True).start()
+        self.addCleanup(self.github_api.server_close)
+        self.addCleanup(self.github_api.shutdown)
         slice1.SliceAcceptance.setUp(self)
         with connect(self.dsn) as conn:
             conn.execute("DELETE FROM telegram_outbox")
             conn.execute("DELETE FROM telegram_updates")
+            # Earlier tests share this database; keep their ready Runs out of this test's publisher.
+            conn.execute("UPDATE runs SET next_publish_at='infinity' WHERE status='ready_to_merge'")
 
     def start_server(self):
-        slice3.Slice3Acceptance.start_server(self)
+        if not hasattr(self, "speech_config"):
+            model = self.root / "model.bin"
+            model.write_bytes(b"test fixture model")
+            self.runner = self.root / "whisper-cli"
+            self.speech_config = self.root / "speech.json"
+            self.set_runner("approve change value")
+        args = type("Args", (), {"dsn": self.dsn, "artifacts": str(self.root / "artifacts"),
+            "username": "user", "password": "password", "worker_id": "worker",
+            "worker_token": "worker-secret", "origin": "https://teem.test",
+            "reviewer_config": str(self.reviewer_file), "speech_config": str(self.speech_config),
+            "speech_scratch": str(self.root / "speech-scratch"), "github_config": str(self.github_file)})()
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.app = App(args)
+        self.server.app.git_base = str(self.git_base)
+        self.url = f"http://127.0.0.1:{self.server.server_port}"
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
         app = self.server.app
         app.telegram_api = f"http://127.0.0.1:{self.api.server_port}"
         app.telegram_token, app.telegram_user_id = "123:secret", USER
+        app.github_api, app.github_token = f"http://127.0.0.1:{self.github_api.server_port}", "test-token"
         if self.use_decider:
             app.decider_api = f"http://127.0.0.1:{self.model.server_port}"
             app.decider = {"api_key": "key", "model": "test-model", "timeout": 10}
+
+    def set_runner(self, text=None, slow=False):
+        """A stand-in whisper-cli; FFmpeg validation and the Bubblewrap sandbox around it are real."""
+        program = ("#!/usr/bin/python3\nfrom pathlib import Path\nimport time\n" +
+                   ("time.sleep(120)\n" if slow else f"Path('/scratch/transcript.txt').write_text({text!r})\n"))
+        self.runner.write_text(program)
+        self.runner.chmod(0o755)
+        self.speech_config.write_text(json.dumps({
+            "executable": str(self.runner), "model": str(self.root / "model.bin"),
+            "executable_sha256": hashlib.sha256(self.runner.read_bytes()).hexdigest(),
+            "model_sha256": hashlib.sha256((self.root / "model.bin").read_bytes()).hexdigest(), "language": "en"}))
+        if hasattr(self, "server"):
+            self.stop_server()
+            self.start_server()
+            self.worker.api.url = self.url
 
     def enable_decider(self):
         self.use_decider = True
@@ -287,8 +354,9 @@ class Slice4Acceptance(unittest.TestCase):
         self.assertEqual((approval["decision"], approval["source"]), ("approve", "telegram_button"))
         self.claim_and_execute()
         self.claim_and_execute()
+        self.assertTrue(github.publish_due(self.server.app))
         self.drain()
-        self.assertTrue(self.texts()[-1].startswith("Ready to merge: Test: Change value"))
+        self.assertEqual(self.texts()[-1], "Pull request open: Test: Change value\nhttps://github.test/teem-test/pull/1")
 
     def test_grant_starts_runs_without_asking_until_revoked(self):
         self.enable_decider()
@@ -402,6 +470,68 @@ class Slice4Acceptance(unittest.TestCase):
             "capabilities": ["code", "check", "bundle", "review"]})["assignment"])
         self.drain()
         self.assertIn("Stopped: Test: Ask first\nStop reason: needs_input: Which file should change?", self.texts()[-1])
+
+    def test_voice_failures_reply_and_leave_no_audio(self):
+        state = self.api.state
+        voice = {"file_id": "v1", "duration": 1, "file_size": 10}
+        good = state["voice"]
+        state["voice"] = b"not audio"
+        self.deliver(message(500, voice=voice))
+        self.assertIn("couldn't transcribe that voice note (invalid recording)", self.texts()[-1])
+        state["voice"] = good
+        self.set_runner(slow=True)
+        with patch("teem.speech.RUNNER_SECONDS", 0.5):
+            self.deliver(message(501, voice=voice))
+        self.assertIn("couldn't transcribe that voice note (transcription timed out)", self.texts()[-1])
+        self.deliver(message(502, voice={**voice, "duration": 121}))
+        self.assertIn("limited to 120 seconds", self.texts()[-1])
+        self.assertEqual(list((self.root / "speech-scratch").iterdir()), [])
+
+    def run_status(self, run_id):
+        with connect(self.dsn) as conn:
+            return conn.execute("SELECT status,stop_reason,pr_url FROM runs WHERE id=%s", (run_id,)).fetchone()
+
+    def test_publication_pushes_the_reviewed_candidate_once(self):
+        run_id = self.propose().split("/")[-1]
+        self.claim_and_execute()
+        self.claim_and_execute()
+        self.github_api.fail_posts = 1
+        self.assertTrue(github.publish_due(self.server.app))
+        self.assertEqual(self.run_status(run_id)["status"], "ready_to_merge")
+        self.assertFalse(github.publish_due(self.server.app), "a transient failure waits for its backoff")
+        with connect(self.dsn) as conn:
+            conn.execute("UPDATE runs SET next_publish_at=now() WHERE id=%s", (run_id,))
+        self.assertTrue(github.publish_due(self.server.app))
+        self.assertEqual(self.run_status(run_id), {"status": "pr_open", "stop_reason": None,
+                                                   "pr_url": "https://github.test/teem-test/pull/1"})
+        with connect(self.dsn) as conn:
+            head = conn.execute("""SELECT x.head_commit FROM runs r JOIN candidates x ON x.id=r.current_candidate_id
+                                   WHERE r.id=%s""", (run_id,)).fetchone()["head_commit"]
+        self.assertEqual(run("git", "rev-parse", f"teem/{run_id}", cwd=self.repo), head)
+        pull = self.github_api.pulls[0]
+        self.assertEqual((pull["title"], pull["head"]), ("Teem: Change value", f"teem-test:teem/{run_id}"))
+        self.assertIn("**Independent review**: pass. Criteria met", pull["body"])
+        # A crash after opening but before recording the PR repeats publication without a second PR.
+        with connect(self.dsn) as conn:
+            conn.execute("UPDATE runs SET status='ready_to_merge',pr_url=NULL,next_publish_at=NULL WHERE id=%s", (run_id,))
+        self.assertTrue(github.publish_due(self.server.app))
+        self.assertEqual(len(self.github_api.pulls), 1)
+        self.assertEqual(self.run_status(run_id)["pr_url"], "https://github.test/teem-test/pull/1")
+
+    def test_revoked_grant_stops_publication(self):
+        with connect(self.dsn) as conn:
+            conn.execute("UPDATE projects SET status='granted' WHERE id=%s", (self.project_id,))
+        status, headers, _ = self.browser("POST", "/requests", {"project": self.project_id,
+            "objective": "Change value", "criteria": "value.txt contains after"})
+        run_id = headers["Location"].split("/")[-1]
+        self.claim_and_execute()
+        self.claim_and_execute()
+        with connect(self.dsn) as conn:
+            conn.execute("UPDATE projects SET status='revoked' WHERE id=%s", (self.project_id,))
+        self.assertTrue(github.publish_due(self.server.app))
+        self.assertEqual(self.run_status(run_id)["stop_reason"], "grant_revoked")
+        self.assertEqual(self.github_api.pulls, [])
+        self.assertEqual(run("git", "branch", "--list", "teem/*", cwd=self.repo), "")
 
 
 if __name__ == "__main__":

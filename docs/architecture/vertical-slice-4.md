@@ -1,6 +1,6 @@
 # Vertical slice 4: Telegram decider, real agents, GitHub pull requests
 
-Status: proposed increment after [slice 3](vertical-slice-3.md). It replaces the phone PWA as the primary interface and replaces the placeholder coder and local reviewer with real coding agents.
+Status: implemented (steps 1–5); the manual acceptance with real services is pending. It follows [slice 3](vertical-slice-3.md) and replaces the phone PWA as the primary interface and replaces the placeholder coder and local reviewer with real coding agents.
 
 ## Outcome and scope
 

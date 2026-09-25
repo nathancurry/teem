@@ -294,7 +294,7 @@ def process_one(app):
 
 
 def run_update(conn, run_id, origin):
-    run = conn.execute("""SELECT r.status,r.stop_reason,r.contract_version,c.body,p.name AS project
+    run = conn.execute("""SELECT r.status,r.stop_reason,r.contract_version,r.pr_url,c.body,p.name AS project
                           FROM runs r JOIN contracts c ON c.run_id=r.id AND c.version=r.contract_version
                           JOIN projects p ON p.id=r.project_id WHERE r.id=%s""", (run_id,)).fetchone()
     contract = run["body"]
@@ -302,6 +302,9 @@ def run_update(conn, run_id, origin):
     text = f"{STATUS_LABELS.get(run['status'], run['status'])}: {run['project']}: {objective}"
     if run["stop_reason"]:
         text += f"\nStop reason: {run['stop_reason']}"
+    if run["pr_url"]:
+        # The pull request is where the user reviews and merges; the Teem page holds the evidence.
+        return text + f"\n{run['pr_url']}", None
     buttons = None
     if run["status"] == "awaiting_approval":
         checks = ", ".join(check["name"] for check in contract["checks"]) or "none (.teem/checks.json not found)"

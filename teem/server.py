@@ -5,12 +5,9 @@ import hmac
 import html
 import json
 import os
-import socket
 import subprocess
 import tempfile
 import threading
-import time
-import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer as HTTPServer
 from pathlib import Path
@@ -33,10 +30,9 @@ from .common import (
 )
 from .db import connect, event, initialize
 from .review import ReviewInputError, build_context, validate_result
-from .push import sender_loop, valid_subscription, vapid_public_key
-from .speech import MAX_AUDIO, SpeechError, SpeechRunner
+from .speech import SpeechRunner
 from . import decider, github, telegram
-from .workflow import cancel_run, create_run, decide_run, reviewer_identity, status_rows
+from .workflow import cancel_run, create_run, decide_run, reviewer_identity, status_rows, stop_run
 
 
 def lock_attempt_rows(conn, attempt_id):
@@ -88,13 +84,6 @@ def expire_leases(conn):
 def attempt_count(conn, run_id):
     return conn.execute("""SELECT count(*) AS n FROM attempts a JOIN tasks t ON t.id=a.task_id
                            WHERE t.run_id=%s""", (run_id,)).fetchone()["n"]
-
-
-def stop_run(conn, run_id, reason, kind="blocked"):
-    prior = conn.execute("SELECT status FROM runs WHERE id=%s", (run_id,)).fetchone()["status"]
-    conn.execute("UPDATE runs SET status=%s,stop_reason=%s,updated_at=now() WHERE id=%s", (kind, reason, run_id))
-    event(conn, run_id, "run_stopped", {"status": kind, "reason": reason},
-          notify=prior != kind and kind in ("blocked", "failed", "checks_failed", "uncertain"))
 
 
 def revoke_ready_for_artifact(conn, candidate):
@@ -276,8 +265,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         try:
             path = urlparse(self.path).path
-            if path in ("/manifest.webmanifest", "/icon.svg", "/icon-192.png", "/icon-512.png",
-                        "/phone.js", "/sw.js"):
+            if path in ("/manifest.webmanifest", "/icon.svg", "/icon-192.png", "/icon-512.png", "/phone.js"):
                 self.static_get(path)
                 return
             if path.startswith("/worker/"):
@@ -324,8 +312,7 @@ class Handler(BaseHTTPRequestHandler):
         name, content_type = {"/icon.svg": ("icon.svg", "image/svg+xml"),
                               "/icon-192.png": ("icon-192.png", "image/png"),
                               "/icon-512.png": ("icon-512.png", "image/png"),
-                              "/phone.js": ("phone.js", "text/javascript; charset=utf-8"),
-                              "/sw.js": ("sw.js", "text/javascript; charset=utf-8")}[path]
+                              "/phone.js": ("phone.js", "text/javascript; charset=utf-8")}[path]
         self.respond(200, (static / name).read_bytes(), content_type)
 
     def do_POST(self):
@@ -346,50 +333,7 @@ class Handler(BaseHTTPRequestHandler):
         except psycopg.errors.UniqueViolation:
             self.respond(409, {"error": "conflicting active run or duplicate decision"})
 
-    def transcribe(self):
-        speech = self.app.speech
-        if speech is None:
-            fail(503, "local recognition unavailable")
-        if not speech.lock.acquire(blocking=False):
-            fail(429, "transcription busy")
-        try:
-            media_type = self.headers.get("Content-Type", "").split(";", 1)[0].lower()
-            try:
-                length = int(self.headers.get("Content-Length", "-1"))
-            except ValueError:
-                fail(400, "invalid content length")
-            if length <= 0 or length > MAX_AUDIO:
-                fail(413, "recording too large or empty")
-            deadline = time.monotonic() + 30
-            parts = []
-            try:
-                while length:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        fail(408, "upload timed out")
-                    self.connection.settimeout(remaining)
-                    part = self.rfile.read(min(length, 65536))
-                    if not part:
-                        fail(400, "incomplete recording")
-                    parts.append(part)
-                    length -= len(part)
-            except (socket.timeout, TimeoutError):
-                fail(408, "upload timed out")
-            audio = b"".join(parts)
-            try:
-                text = speech._transcribe(audio, media_type)
-            except SpeechError as exc:
-                fail(400 if "invalid" in str(exc) or "unsupported" in str(exc) else 504,
-                     str(exc))
-            self.respond(200, {"text": text})
-        finally:
-            speech.lock.release()
-
     def browser_get(self, path):
-        if path == "/config":
-            self.respond(200, {"vapid_public_key": self.app.vapid_public_key,
-                               "speech_available": self.app.speech is not None})
-            return
         if path == "/state" or path.startswith("/runs/") and path.endswith("/state"):
             run_id = path.split("/")[2] if path != "/state" else None
             with connect(self.app.dsn) as conn:
@@ -426,20 +370,13 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 content = ("<h1>New coding request</h1><form method='post' action='/requests'>"
                            f"<label>Project <select name='project'>{options}</select></label>"
-                           "<p>Local recognition runs on the Teem server, not this phone. A recording is uploaded"
-                           " to this server for transcription and is discarded afterward.</p>"
                            "<label>Objective <textarea id='objective' name='objective' required></textarea></label>"
-                           "<button type='button' class='mic' data-field='objective' aria-label='Record objective'>🎙 Record objective</button>"
                            "<label>Acceptance criteria <textarea id='criteria' name='criteria' required></textarea></label>"
-                           "<button type='button' class='mic' data-field='criteria' aria-label='Record acceptance criteria'>🎙 Record criteria</button>"
-                           "<p id='recording-status' role='status' aria-live='polite'></p>"
                            "<label>Revision limit <select name='revisions'><option>0</option><option>1</option>"
                            "<option selected>2</option></select></label>"
                            f"<input type='hidden' name='dedupe_key' value='{new_id()}'>"
                            "<button>Propose</button></form>"
-                           "<section id='notifications'><button type='button' id='enable-push'>Enable notifications</button> "
-                           "<button type='button' id='disable-push'>Disable notifications</button> "
-                           "<span id='push-status' role='status'></span></section>"
+
                            "<p id='refresh-status' role='status'></p><h2>Pending approvals and Runs</h2>"
                            "<ul id='run-list'>" + items + "</ul>")
                 conn.commit()
@@ -541,42 +478,6 @@ class Handler(BaseHTTPRequestHandler):
         fail(404, "not found")
 
     def browser_post(self, path):
-        if path == "/transcribe":
-            return self.transcribe()
-        if path == "/push/subscribe":
-            if not self.app.vapid_public_key:
-                fail(503, "notifications unavailable")
-            data = self.json_body()
-            if not valid_subscription(data):
-                fail(400, "invalid push subscription")
-            previous = data.get("previous_id")
-            # A replaced install may remove its old endpoint after registering a new one.
-            with connect(self.app.dsn) as conn:
-                row = conn.execute("""INSERT INTO push_subscriptions(id,endpoint,p256dh,auth)
-                                      VALUES (%s,%s,%s,%s)
-                                      ON CONFLICT (endpoint) DO UPDATE SET p256dh=EXCLUDED.p256dh,auth=EXCLUDED.auth
-                                      RETURNING id""",
-                                   (new_id(), data["endpoint"], data["keys"]["p256dh"],
-                                    data["keys"]["auth"])).fetchone()
-                if previous:
-                    try:
-                        prior_id = uuid.UUID(previous)
-                    except (ValueError, TypeError):
-                        fail(400, "invalid previous subscription")
-                    if prior_id != row["id"]:
-                        conn.execute("DELETE FROM push_subscriptions WHERE id=%s", (prior_id,))
-            self.respond(200, {"id": str(row["id"])})
-            return
-        if path == "/push/unsubscribe":
-            data = self.json_body()
-            try:
-                subscription_id = uuid.UUID(data.get("id", ""))
-            except (ValueError, TypeError):
-                fail(400, "invalid subscription")
-            with connect(self.app.dsn) as conn:
-                conn.execute("DELETE FROM push_subscriptions WHERE id=%s", (subscription_id,))
-            self.respond(200, {"disabled": True})
-            return
         form = self.form()
         with connect(self.app.dsn) as conn:
             expire_leases(conn)
@@ -1056,7 +957,7 @@ class Handler(BaseHTTPRequestHandler):
                 conn.execute("UPDATE tasks SET status=%s WHERE id=%s", (task_status, row["task_id"]))
                 conn.execute("UPDATE runs SET status=%s,updated_at=now() WHERE id=%s", (status, row["run_id"]))
                 event(conn, row["run_id"], "attempt_reported", {"attempt_id": attempt_id, "outcome": outcome, "run_status": status},
-                      notify=status in ("ready_to_merge", "blocked", "failed", "checks_failed", "uncertain")
+                      notify=status in ("blocked", "failed", "checks_failed", "uncertain")
                       and row["run_status"] != status)
                 conn.commit()
                 self.respond(200, {"status": status})
@@ -1248,14 +1149,10 @@ class App:
         if bool(speech_config) != bool(speech_scratch):
             raise ValueError("speech configuration and scratch path must be provided together")
         self.speech = SpeechRunner(speech_config, speech_scratch) if speech_config else None
-        self.vapid_private_key = getattr(args, "vapid_private_key", None)
-        self.vapid_subject = getattr(args, "vapid_subject", None)
-        if bool(self.vapid_private_key) != bool(self.vapid_subject):
-            raise ValueError("VAPID key and subject must be provided together")
-        self.vapid_public_key = vapid_public_key(self.vapid_private_key) if self.vapid_private_key else None
         github_config = github.load_config(args.github_config)
         self.github_owners, self.github_token = github_config["owners"], github_config["token"]
         self.git_base = github.GIT_BASE
+        self.github_api = github.API
         # A rebuildable cache of GitHub repositories; it holds no authoritative state.
         self.mirror_dir = self.artifact_dir / "mirrors"
         self.mirror_dir.mkdir(exist_ok=True, mode=0o700)
@@ -1310,8 +1207,6 @@ def main():
     serve.add_argument("--reviewer-config", required=True, help="server-owned local review identity and instructions JSON")
     serve.add_argument("--speech-config", help="server-owned whisper-cli executable, model identity, and language JSON")
     serve.add_argument("--speech-scratch", help="private temporary directory outside artifacts and backups")
-    serve.add_argument("--vapid-private-key", help="stable server-owned VAPID private key PEM")
-    serve.add_argument("--vapid-subject", help="VAPID contact, e.g. mailto:operator@example.com")
     serve.add_argument("--github-config", required=True, help="allowed GitHub owners and optional token JSON")
     serve.add_argument("--decider-config", help="OpenRouter API key, model, and timeout JSON")
     serve.add_argument("--telegram-config", help="server-owned bot token and allowed Telegram user_id JSON")
@@ -1326,8 +1221,7 @@ def main():
         server = ThreadingHTTPServer((args.host, args.port), Handler)
         server.app = App(args)
         threading.Thread(target=server.app.sweep, daemon=True).start()
-        if server.app.vapid_public_key:
-            threading.Thread(target=sender_loop, args=(server.app,), daemon=True).start()
+        threading.Thread(target=github.publisher_loop, args=(server.app,), daemon=True).start()
         if server.app.telegram_token:
             threading.Thread(target=telegram.poll_loop, args=(server.app,), daemon=True).start()
             threading.Thread(target=telegram.sender_loop, args=(server.app,), daemon=True).start()

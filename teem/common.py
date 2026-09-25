@@ -19,7 +19,8 @@ STATUS_LABELS = {"awaiting_approval": "Decision required", "queued": "Queued",
                  "reviewing": "Independent review", "uncertain": "Execution unresolved",
                  "cancelling": "Cancellation unresolved", "failed": "Execution failed",
                  "checks_failed": "Checks failed", "blocked": "Stopped",
-                 "ready_to_merge": "Ready to merge", "denied": "Denied", "cancelled": "Cancelled"}
+                 "ready_to_merge": "Ready to merge", "pr_open": "Pull request open",
+                 "denied": "Denied", "cancelled": "Cancelled"}
 
 
 class ApiError(Exception):
