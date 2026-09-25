@@ -14,6 +14,13 @@ MAX_REVIEW_INPUT_BYTES = 24 * 1024
 REVIEW_SECONDS = 300
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 
+STATUS_LABELS = {"awaiting_approval": "Decision required", "queued": "Queued",
+                 "coding": "Coding and checks", "awaiting_review": "Awaiting review",
+                 "reviewing": "Independent review", "uncertain": "Execution unresolved",
+                 "cancelling": "Cancellation unresolved", "failed": "Execution failed",
+                 "checks_failed": "Checks failed", "blocked": "Stopped",
+                 "ready_to_merge": "Ready to merge", "denied": "Denied", "cancelled": "Cancelled"}
+
 
 def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"))

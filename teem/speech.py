@@ -13,8 +13,8 @@ from pathlib import Path
 
 
 MAX_AUDIO = 8 * 1024 * 1024
-MAX_SECONDS = 60
-RUNNER_SECONDS = 90
+MAX_SECONDS = 120
+RUNNER_SECONDS = 180
 
 
 class SpeechError(Exception):
@@ -62,7 +62,9 @@ class SpeechRunner:
 
     def _limits(self):
         resource.setrlimit(resource.RLIMIT_AS, (2 * 1024**3, 2 * 1024**3))
-        resource.setrlimit(resource.RLIMIT_CPU, (90, 90))
+        # CPU time sums across whisper threads; the wall-clock deadline is the real bound.
+        cpu = int(RUNNER_SECONDS * (os.cpu_count() or 1)) + 1
+        resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu))
         resource.setrlimit(resource.RLIMIT_FSIZE, (64 * 1024**2, 64 * 1024**2))
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
         resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
@@ -114,7 +116,7 @@ class SpeechRunner:
             self.lock.release()
 
     def _transcribe(self, audio, media_type):
-        if media_type not in ("audio/webm", "audio/mp4") or not 0 < len(audio) <= MAX_AUDIO:
+        if media_type not in ("audio/webm", "audio/mp4", "audio/ogg") or not 0 < len(audio) <= MAX_AUDIO:
             raise SpeechError("unsupported or empty recording")
         deadline = time.monotonic() + RUNNER_SECONDS
         with tempfile.TemporaryDirectory(prefix="teem-speech-", dir=self.scratch_root) as directory:
@@ -137,7 +139,8 @@ class SpeechRunner:
                 streams = probe["streams"]
                 valid = len(streams) == 1 and streams[0]["codec_type"] == "audio" and (
                     media_type == "audio/webm" and "matroska" in formats and streams[0]["codec_name"] == "opus" or
-                    media_type == "audio/mp4" and "mov" in formats and streams[0]["codec_name"] == "aac")
+                    media_type == "audio/mp4" and "mov" in formats and streams[0]["codec_name"] == "aac" or
+                    media_type == "audio/ogg" and "ogg" in formats and streams[0]["codec_name"] == "opus")
                 if not valid or duration is not None and not 0 < float(duration) <= MAX_SECONDS + 1:
                     raise ValueError
             except (ValueError, KeyError, TypeError, IndexError) as exc:

@@ -43,6 +43,7 @@ services:
         --reviewer-config /srv/teem/config/reviewer.json
         --vapid-private-key /srv/teem/config/vapid.pem
         --vapid-subject "$$TEEM_VAPID_SUBJECT"
+        --telegram-config /srv/teem/config/telegram.json
         --host 0.0.0.0
     ports:
       - "127.0.0.1:8765:8765"

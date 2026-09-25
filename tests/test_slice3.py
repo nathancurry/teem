@@ -166,9 +166,9 @@ class Slice3Acceptance(unittest.TestCase):
         for kind in ("audio/webm", "audio/mp4"):
             status, _, body = self.raw_request("POST", "/transcribe", self.audio(kind), kind)
             self.assertEqual(status, 200, body)
-        self.assertEqual(self.raw_request("POST", "/transcribe", self.audio("audio/webm", 60), "audio/webm")[0], 200)
+        self.assertEqual(self.raw_request("POST", "/transcribe", self.audio("audio/webm", 120), "audio/webm")[0], 200)
         self.assertEqual(self.raw_request("POST", "/transcribe", b"junk", "audio/webm")[0], 400)
-        self.assertEqual(self.raw_request("POST", "/transcribe", self.audio("audio/webm", 61), "audio/webm")[0], 400)
+        self.assertEqual(self.raw_request("POST", "/transcribe", self.audio("audio/webm", 121), "audio/webm")[0], 400)
         parsed = urlparse(self.url)
         conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=5)
         try:

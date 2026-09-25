@@ -24,6 +24,7 @@ from .common import (
     MAX_ARTIFACT_BYTES,
     PROTOCOL,
     RUN_SECONDS,
+    STATUS_LABELS,
     canonical,
     check_config,
     digest,
@@ -33,6 +34,7 @@ from .db import connect, event, initialize
 from .review import ReviewInputError, build_context, validate_result
 from .push import sender_loop, valid_subscription, vapid_public_key
 from .speech import MAX_AUDIO, SpeechError, SpeechRunner
+from . import telegram
 
 
 class ApiError(Exception):
@@ -209,14 +211,6 @@ def page(title, content):
             "li{margin:.5rem 0}a{color:#064c9e}</style>"
             "<header><a href='/'>Teem</a></header>" + content +
             "<script src='/phone.js' defer></script></html>").encode()
-
-
-STATUS_LABELS = {"awaiting_approval": "Decision required", "queued": "Queued",
-                 "coding": "Coding and checks", "awaiting_review": "Awaiting review",
-                 "reviewing": "Independent review", "uncertain": "Execution unresolved",
-                 "cancelling": "Cancellation unresolved", "failed": "Execution failed",
-                 "checks_failed": "Checks failed", "blocked": "Stopped",
-                 "ready_to_merge": "Ready to merge", "denied": "Denied", "cancelled": "Cancelled"}
 
 
 class ThreadingHTTPServer(HTTPServer):
@@ -1332,6 +1326,12 @@ class App:
         if bool(self.vapid_private_key) != bool(self.vapid_subject):
             raise ValueError("VAPID key and subject must be provided together")
         self.vapid_public_key = vapid_public_key(self.vapid_private_key) if self.vapid_private_key else None
+        telegram_config = getattr(args, "telegram_config", None)
+        self.telegram_api = telegram.API
+        self.telegram_token = self.telegram_user_id = None
+        if telegram_config:
+            config = telegram.load_config(telegram_config)
+            self.telegram_token, self.telegram_user_id = config["token"], config["user_id"]
         reviewer_path = getattr(args, "reviewer_config", None)
         self.reviewer = json.loads(Path(reviewer_path).read_text()) if reviewer_path else None
         if not self.reviewer or set(self.reviewer) not in (
@@ -1386,6 +1386,7 @@ def main():
     serve.add_argument("--speech-scratch", help="private temporary directory outside artifacts and backups")
     serve.add_argument("--vapid-private-key", help="stable server-owned VAPID private key PEM")
     serve.add_argument("--vapid-subject", help="VAPID contact, e.g. mailto:operator@example.com")
+    serve.add_argument("--telegram-config", help="server-owned bot token and allowed Telegram user_id JSON")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
@@ -1406,6 +1407,9 @@ def main():
         threading.Thread(target=server.app.sweep, daemon=True).start()
         if server.app.vapid_public_key:
             threading.Thread(target=sender_loop, args=(server.app,), daemon=True).start()
+        if server.app.telegram_token:
+            threading.Thread(target=telegram.poll_loop, args=(server.app,), daemon=True).start()
+            threading.Thread(target=telegram.sender_loop, args=(server.app,), daemon=True).start()
         try:
             server.serve_forever()
         finally:

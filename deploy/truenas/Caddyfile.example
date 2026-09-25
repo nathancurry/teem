@@ -6,7 +6,7 @@ teem.example.com {
 
     reverse_proxy 127.0.0.1:8765 {
         transport http {
-            read_timeout 120s
+            read_timeout 210s
         }
     }
 }

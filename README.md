@@ -77,15 +77,18 @@ teem-worker --url https://teem.example --token "$TEEM_WORKER_TOKEN" --worker-id 
 
 The server binds to `127.0.0.1:8765` by default. The proxy must forward `Authorization` and `Origin`. Browser decisions require Basic authentication and same-origin POSTs; workers use a separate bearer credential and protocol version 2.
 
-The phone app must be served at the HTTPS origin root so `/sw.js` can control it. Allow authenticated 8 MiB audio uploads and 30-second upload timeouts at the proxy. Keep authenticated pages and API responses uncached. Allow outbound HTTPS Web Push to `fcm.googleapis.com`, `updates.push.services.mozilla.com`, and `*.push.apple.com`; the application rejects redirects and private/local push destinations. Confirm the host can transcribe a 60-second clip within the 90-second decode/inference bound and 2 GiB process limit before enabling dictation. The service receives raw audio only until local transcription completes. Submitted text retains the existing Run lifetime and downstream project routing policy.
+The phone app must be served at the HTTPS origin root so `/sw.js` can control it. Allow authenticated 8 MiB audio uploads and 30-second upload timeouts at the proxy. Keep authenticated pages and API responses uncached. Allow outbound HTTPS Web Push to `fcm.googleapis.com`, `updates.push.services.mozilla.com`, and `*.push.apple.com`; the application rejects redirects and private/local push destinations. Confirm the host can transcribe a 120-second clip within the 180-second decode/inference bound and 2 GiB process limit before enabling dictation. The service receives raw audio only until local transcription completes. Submitted text retains the existing Run lifetime and downstream project routing policy.
 
 Limits are a 30-minute Run deadline from approval, eight Attempts across the Run, two Attempts per Task, zero to two revisions, a 15-minute coder timeout, a five-minute timeout per check, and the configured finite reviewer timeout. Each subprocess is also clamped to the remaining Run deadline. Candidate bundles are capped at 50 MiB and review input at 24 KiB so it fits the configured 32K context. A lost lease remains unresolved until worker reconciliation confirms stop.
+
+Telegram (slice 4, in progress): pass `--telegram-config telegram.json` containing `{"token": "<bot token>", "user_id": <numeric user id>}`. The server long-polls the Bot API, stores each accepted update before confirming it, echoes transcribed voice notes, and sends Run check-ins with links to the Run page. Updates from any other user or chat are recorded only as ignored IDs. The decider is not wired yet, so chat messages cannot start work. Apply [slice-4.sql](docs/architecture/slice-4.sql) once to an existing slice-3 database. Voice notes use the same local runner, now bounded to 120-second clips and 180 seconds of decode and inference; confirm that bound on the server CPU with the chosen model.
 
 Run the PostgreSQL and Bubblewrap acceptance suite with a disposable database admin connection:
 
 ```sh
 TEEM_TEST_DSN=postgresql://postgres:password@127.0.0.1:5432/postgres python -m unittest -v tests.test_slice
 TEEM_TEST_DSN=postgresql://postgres:password@127.0.0.1:5432/postgres python -m unittest -v tests.test_slice3
+TEEM_TEST_DSN=postgresql://postgres:password@127.0.0.1:5432/postgres python -m unittest -v tests.test_slice4
 ```
 
 Set `TEEM_OLLAMA_SMOKE_MODEL` to an installed local model to include the real reviewer smoke test.
