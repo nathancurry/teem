@@ -1,11 +1,11 @@
-# Teem vertical slice 3
+# Teem (slice 4 in progress)
 
-Teem runs one authorized coding Task, objective checks, and an independent read-only review. A valid review can request up to two bounded revisions. Passing checks and a fresh passing review of the preserved Candidate produce **Ready to merge**. The phone PWA adds server-local dictation and generic Web Push hints. Dictation and notification never authorize work. Merge and deployment remain outside this slice.
+Teem runs one authorized coding Task on a GitHub repository, objective checks, and an independent read-only review. A valid review can request up to two bounded revisions. Passing checks and a fresh passing review of the preserved Candidate produce **Ready to merge**. A Telegram bot is the main interface: voice notes and text go to a model-backed decider, which proposes Runs through validated tools. Work starts only after an Approve button tap or under a standing project grant the user created with an Allow button. The phone PWA remains for evidence pages. Merge and deployment remain outside Teem. See [slice 4](docs/architecture/vertical-slice-4.md); steps 1–2 (Telegram channel, decider, grants) are implemented, and the real coding agents, container sandbox, and pull requests are not yet.
 
 ## Requirements
 
 - Python 3.11+, PostgreSQL, Git, Bash, and Bubblewrap on the worker.
-- A worker-owned local repository for each project. Coder and check commands run in isolated workspaces. The reviewer executable must be installed outside the repository.
+- Projects are GitHub repositories under configured owners. The server and worker each keep their own mirror clone. Coder and check commands run in isolated workspaces. The reviewer executable must be installed on the worker.
 - Durable server artifact storage and worker state storage. Back up artifacts with PostgreSQL. HTTPS termination in front of the loopback server is required for worker connections.
 - FFmpeg/ffprobe, Bubblewrap, and a static `whisper-cli` built from [whisper.cpp v1.9.4](https://github.com/ggml-org/whisper.cpp/releases/tag/v1.9.4). Install the [`ggml-base.en.bin` model](https://github.com/ggml-org/whisper.cpp#quick-start) outside the repository. Its SHA-256 is `a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002`. The server verifies both the model and runner executable hashes at startup. A static binary avoids mounting extra runner libraries into the speech sandbox.
 - One stable VAPID private key outside the repository and a `mailto:` contact. The Web Push library is pinned to `pywebpush==2.5.0`.
@@ -32,15 +32,27 @@ Generate and retain one VAPID key. Keep it out of the repository and back it up 
 python -c 'from py_vapid import Vapid02; v=Vapid02(); v.generate_keys(); v.save_key("/srv/teem/secrets/vapid.pem")'
 ```
 
-Register a project with a checks JSON file, for example:
+Projects are created from Telegram when the decider proposes work on a GitHub `owner/name`. Each Run's base is the default-branch head when it is proposed. Its objective checks come from `.teem/checks.json` at that commit, for example:
 
 ```json
 [{"name":"unit tests","argv":["/usr/bin/python3","-m","unittest","discover"]}]
 ```
 
-```sh
-teem-server register-project --dsn "$TEEM_DSN" --id my-project --name 'My project' --base "$(git -C /srv/teem/clones/my-project rev-parse HEAD)" --checks checks.json
+A repository without that file gets Runs with no objective checks, and the proposal says so. The server's GitHub configuration lists the owners Teem may work under and an optional token for private repositories:
+
+```json
+{"owners": ["your-github-user"], "token": "<fine-grained token with contents read>"}
 ```
+
+The server keeps its mirrors under `<artifacts>/mirrors`; they are a rebuildable cache. The decider configuration names an OpenRouter model:
+
+```json
+{"api_key": "<OpenRouter key>", "model": "anthropic/claude-sonnet-5", "timeout": 60}
+```
+
+Use the model's exact OpenRouter slug. The decider receives the recent conversation, project names, and Run status summaries, but no source code.
+
+Without a decider configuration, chat messages are acknowledged but cannot start work.
 
 The server reviewer configuration fixes the runner identity, instructions, local Ollama destination, model, and timeout. The model must already be installed locally and fit the bounded context:
 
@@ -48,22 +60,20 @@ The server reviewer configuration fixes the runner identity, instructions, local
 {"identity":"local-ollama/qwen2.5-coder:14b-32k","instructions":"Review the supplied Candidate against its original acceptance criteria.","destination":"local-ollama","model":"qwen2.5-coder:14b-32k","timeout":600}
 ```
 
-Install `teem/reviewer_ollama.py` as an executable outside the project repository, such as `/srv/teem/bin/reviewer-ollama`. The worker project file maps the project ID to locally controlled paths and commands. `instructions_sha256` is the SHA-256 of the exact UTF-8 instructions above. The reviewer executable reads `/context.json` and writes one JSON judgment to standard output. It runs with a fresh read-only context, disposable scratch, no repository mount, and no network. A one-use Unix socket in that scratch connects only to the worker's fixed `127.0.0.1:11434` Ollama endpoint; the worker supplies the frozen model and context.
+Install `teem/reviewer_ollama.py` as an executable on the worker, such as `/srv/teem/bin/reviewer-ollama`. The worker policy file lists the GitHub owners the worker accepts and its coder and reviewer commands. The worker verifies that each contract's checks match `.teem/checks.json` at the contract's base in its own mirror. `instructions_sha256` is the SHA-256 of the exact UTF-8 instructions above. The reviewer executable reads `/context.json` and writes one JSON judgment to standard output. It runs with a fresh read-only context, disposable scratch, no repository mount, and no network. A one-use Unix socket in that scratch connects only to the worker's fixed `127.0.0.1:11434` Ollama endpoint; the worker supplies the frozen model and context.
 
 ```json
 {
-  "my-project": {
-    "repo": "/srv/teem/clones/my-project",
-    "coder": ["/usr/bin/python3", "/workspace/coder.py"],
-    "checks": [{"name":"unit tests","argv":["/usr/bin/python3","-m","unittest","discover"]}],
-    "reviewer": {
-      "identity": "local-ollama/qwen2.5-coder:14b-32k",
-      "instructions_sha256": "<SHA-256 of exact instructions>",
-      "destination": "local-ollama",
-      "model": "qwen2.5-coder:14b-32k",
-      "timeout": 600,
-      "executable": "/srv/teem/bin/reviewer-ollama"
-    }
+  "owners": ["your-github-user"],
+  "token": "<optional read-only token for private repositories>",
+  "coder": ["/usr/bin/python3", "/workspace/coder.py"],
+  "reviewer": {
+    "identity": "local-ollama/qwen2.5-coder:14b-32k",
+    "instructions_sha256": "<SHA-256 of exact instructions>",
+    "destination": "local-ollama",
+    "model": "qwen2.5-coder:14b-32k",
+    "timeout": 600,
+    "executable": "/srv/teem/bin/reviewer-ollama"
   }
 }
 ```
@@ -71,7 +81,7 @@ Install `teem/reviewer_ollama.py` as an executable outside the project repositor
 Start one server and one outbound worker:
 
 ```sh
-teem-server serve --dsn "$TEEM_DSN" --artifacts /srv/teem/artifacts --username "$TEEM_USER" --password "$TEEM_PASSWORD" --worker-id worker-1 --worker-token "$TEEM_WORKER_TOKEN" --origin https://teem.example --reviewer-config reviewer.json --speech-config speech.json --speech-scratch /srv/teem/speech-scratch --vapid-private-key /srv/teem/secrets/vapid.pem --vapid-subject mailto:operator@example.com
+teem-server serve --dsn "$TEEM_DSN" --artifacts /srv/teem/artifacts --username "$TEEM_USER" --password "$TEEM_PASSWORD" --worker-id worker-1 --worker-token "$TEEM_WORKER_TOKEN" --origin https://teem.example --reviewer-config reviewer.json --speech-config speech.json --speech-scratch /srv/teem/speech-scratch --vapid-private-key /srv/teem/secrets/vapid.pem --vapid-subject mailto:operator@example.com --github-config github.json --decider-config decider.json --telegram-config telegram.json
 teem-worker --url https://teem.example --token "$TEEM_WORKER_TOKEN" --worker-id worker-1 --projects projects.json --state-dir /srv/teem/worker-state
 ```
 
@@ -81,7 +91,7 @@ The phone app must be served at the HTTPS origin root so `/sw.js` can control it
 
 Limits are a 30-minute Run deadline from approval, eight Attempts across the Run, two Attempts per Task, zero to two revisions, a 15-minute coder timeout, a five-minute timeout per check, and the configured finite reviewer timeout. Each subprocess is also clamped to the remaining Run deadline. Candidate bundles are capped at 50 MiB and review input at 24 KiB so it fits the configured 32K context. A lost lease remains unresolved until worker reconciliation confirms stop.
 
-Telegram (slice 4, in progress): pass `--telegram-config telegram.json` containing `{"token": "<bot token>", "user_id": <numeric user id>}`. The server long-polls the Bot API, stores each accepted update before confirming it, echoes transcribed voice notes, and sends Run check-ins with links to the Run page. Updates from any other user or chat are recorded only as ignored IDs. The decider is not wired yet, so chat messages cannot start work. Apply [slice-4.sql](docs/architecture/slice-4.sql) once to an existing slice-3 database. Voice notes use the same local runner, now bounded to 120-second clips and 180 seconds of decode and inference; confirm that bound on the server CPU with the chosen model.
+Telegram: pass `--telegram-config telegram.json` containing `{"token": "<bot token>", "user_id": <numeric user id>}`. The server long-polls the Bot API, stores each accepted update before confirming it, echoes transcribed voice notes, and passes the text to the decider. Decisions arrive as Approve/Deny and Allow/Deny buttons composed from current state, so a late message never offers a decision already made. Typed `/revoke owner/name` removes a standing grant; commands are never taken from transcripts. Updates from any other user or chat are recorded only as ignored IDs. Apply [slice-4.sql](docs/architecture/slice-4.sql) once to an existing slice-3 database. Voice notes use the same local runner, now bounded to 120-second clips and 180 seconds of decode and inference; confirm that bound on the server CPU with the chosen model.
 
 Run the PostgreSQL and Bubblewrap acceptance suite with a disposable database admin connection:
 

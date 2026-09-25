@@ -39,16 +39,15 @@ The decider is a server module. Each processed update triggers one model call th
 
 Source code, diffs, and check output are not sent to the decider. Adversary summaries and stop reasons are.
 
-The decider acts only through these tools. The server validates each call against current state and rejects invalid calls without side effects:
+The model's text content is sent as the reply. Beyond that, the decider acts only through these tools. The server validates each call against current state and rejects invalid calls without side effects:
 
 | Tool | Effect |
 | --- | --- |
-| `reply(text)` | Queue a text message. |
-| `propose_run(repo, objective, acceptance_criteria)` | Create a Request (`tg:<update_id>`), Run, and contract version 1. For a granted repository, the controller records an Approval with source `project_grant:<id>` and queues the Task in the same transaction. Otherwise, the repository must already have a pending grant proposal, and the Run waits with Approve/Deny buttons. |
-| `propose_project(repo)` | Create or reuse a pending project row for a GitHub `owner/name` inside the configured owner allowlist, and send Allow/Deny buttons. |
+| `propose_run(repo, objective, acceptance_criteria)` | Create the project row if needed, then a Request (`tg:<update_id>`), Run, and contract version 1. For a granted repository, the controller records an Approval with source `project_grant:<grant_id>` and queues the Task in the same transaction. Otherwise, the Run waits for an Approve/Deny button, which approves only that Run. |
+| `propose_project(repo)` | Create or reuse the project row for a GitHub `owner/name` inside the configured owner allowlist, give it a fresh grant ID, and send Allow/Deny buttons. |
 | `cancel_run(run_id)` | Apply the existing cancellation transition. |
 
-Ask clarifying questions with `reply`. The user's next message arrives with the conversation history; no pending-question record is needed. A turn may call `reply` plus at most one state-changing tool. Invalid tool calls and model timeouts produce a short error reply.
+Ask clarifying questions in the reply text. The user's next message arrives with the conversation history; no pending-question record is needed. A turn may call at most one tool. Invalid tool calls and model timeouts produce a short error reply.
 
 The decider cannot approve, grant, revoke, merge, change limits, or edit a contract. Words such as "yes", "approve", or "merge" have no decision meaning in text or voice; only callback buttons decide.
 
@@ -61,7 +60,7 @@ A project is a GitHub repository. Replace the static registration (fixed base co
 3. A granted project authorizes, for any future Run on that repository: code, check, review, and revise; pushing to `teem/<run id>`; and opening one PR against the default branch. It never authorizes merging, other branches, releases, repository settings, or other repositories.
 4. `/revoke owner/name`, typed as a bot command and parsed by the server rather than the decider, revokes the grant. Revocation blocks new Runs and publication. An in-flight Run stops as `blocked` before publishing.
 
-Each Run's contract records its base: the default-branch head at proposal time, resolved by the server with its GitHub token. Checks come from `.teem/checks.json` at that base commit. The contract records their hash, as in slice 2. If the file is missing, the contract records an empty check list, and the proposal message and PR body say so. The coder cannot change the checks for its own Run, because the checks are read from the base commit.
+Each Run's contract records its base: the default-branch head at proposal time. The server resolves it by fetching its own mirror clone of the repository, using its GitHub token for private repositories. Checks come from `.teem/checks.json` at that base commit. The contract records their hash, as in slice 2. If the file is missing, the contract records an empty check list, and the proposal message and PR body say so. The coder cannot change the checks for its own Run, because the checks are read from the base commit.
 
 Worker-local policy remains an intersection. `projects.json` becomes a list of allowed GitHub owners plus the agent image and credential paths. The worker refuses assignments outside those owners.
 
@@ -147,10 +146,10 @@ Add explicit SQL in `docs/architecture/slice-4.sql`:
 
 | Table | Change |
 | --- | --- |
-| `projects` | Add `uuid` key, unique `github_repo`, `status` (`proposed`, `granted`, `denied`, `revoked`), `decided_at`. Drop `base_commit`, `checks`, `check_hash`; contracts already carry them. |
+| `projects` | The key becomes the lowercase GitHub `owner/name`. Add unique `grant_id uuid` (carried by Allow buttons and replaced on each new prompt), `status` (`proposed`, `granted`, `denied`, `revoked`), and `decided_at`. Drop `base_commit`, `checks`, and `check_hash`; contracts already carry them. Existing slice-3 projects become `revoked`. |
 | `runs` | Add nullable `pr_url`; add statuses `publishing` and `pr_open`. |
-| `telegram_updates` | `update_id bigint PRIMARY KEY`, `kind`, `payload jsonb`, `received_at`, nullable `processed_at`. |
-| `telegram_outbox` | `id`, nullable `run_id`, `text`, nullable `buttons jsonb`, `state` (`pending`, `sent`, `abandoned`), `attempt_count`, `next_attempt_at`, nullable `telegram_message_id`. |
+| `telegram_updates` | `update_id bigint PRIMARY KEY`, `kind` (`text`, `voice`, `callback`, `unsupported`, `ignored`), `payload jsonb`, nullable `text` (message or transcript), `received_at`, nullable `processed_at`. |
+| `telegram_outbox` | `id`, nullable `run_id`, nullable `project_id`, nullable `text`, `state` (`pending`, `sent`, `abandoned`), `attempt_count`, `next_attempt_at`, nullable `telegram_message_id`. A row with a Run or project and no text is composed when sent, from current state, with buttons only if the decision is still pending. |
 
 Drop `push_subscriptions` and `notification_deliveries`. Remove the Web Push sender, `sw.js` push handling, VAPID configuration, and the PWA dictation UI. Keep the authenticated HTML Run and evidence pages for inspecting detail behind a link; they get no further investment.
 

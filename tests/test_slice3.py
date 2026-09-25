@@ -55,9 +55,11 @@ class Slice3Acceptance(unittest.TestCase):
             "worker_token": "worker-secret", "origin": "https://teem.test",
             "reviewer_config": str(self.reviewer_file), "speech_config": str(self.speech_config),
             "speech_scratch": str(self.root / "speech-scratch"),
-            "vapid_private_key": str(self.vapid_key), "vapid_subject": "mailto:test@example.com"})()
+            "vapid_private_key": str(self.vapid_key), "vapid_subject": "mailto:test@example.com",
+            "github_config": str(self.github_file)})()
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.server.app = App(args)
+        self.server.app.git_base = str(self.git_base)
         self.url = f"http://127.0.0.1:{self.server.server_port}"
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()

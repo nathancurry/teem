@@ -19,32 +19,23 @@ from urllib.parse import parse_qs, urlparse
 import psycopg
 
 from .common import (
+    ApiError,
     COMMIT_RE,
     LEASE_SECONDS,
     MAX_ARTIFACT_BYTES,
     PROTOCOL,
-    RUN_SECONDS,
     STATUS_LABELS,
     canonical,
-    check_config,
     digest,
+    fail,
     new_id,
 )
 from .db import connect, event, initialize
 from .review import ReviewInputError, build_context, validate_result
 from .push import sender_loop, valid_subscription, vapid_public_key
 from .speech import MAX_AUDIO, SpeechError, SpeechRunner
-from . import telegram
-
-
-class ApiError(Exception):
-    def __init__(self, status, message):
-        self.status = status
-        self.message = message
-
-
-def fail(status, message):
-    raise ApiError(status, message)
+from . import decider, github, telegram
+from .workflow import cancel_run, create_run, decide_run, reviewer_identity, status_rows
 
 
 def lock_attempt_rows(conn, attempt_id):
@@ -174,15 +165,6 @@ def prepare_reviews(app):
             event(conn, run_id, "review_queued", {"candidate_id": str(row["id"]), "context_sha256": context["sha256"]})
 
 
-def reviewer_identity(config):
-    result = {"identity": config["identity"],
-              "instructions_sha256": hashlib.sha256(config["instructions"].encode()).hexdigest(),
-              "destination": config["destination"], "timeout": config["timeout"]}
-    if config["destination"] == "local-ollama":
-        result["model"] = config["model"]
-    return result
-
-
 def assignment(row):
     return {"attempt_id": str(row["attempt_id"]), "task_id": str(row["task_id"]),
             "generation": row["generation"], "project_id": row["project_id"],
@@ -220,37 +202,6 @@ class ThreadingHTTPServer(HTTPServer):
         if hasattr(self, "app"):
             self.app.stop()
         super().server_close()
-
-
-def status_rows(conn, run_id=None):
-    rows = conn.execute("""SELECT r.id,r.project_id,p.name AS project_name,r.status,r.stop_reason,
-                          r.updated_at,c.body,r.current_candidate_id,
-                          COALESCE((SELECT max(t.revision_number) FROM tasks t WHERE t.run_id=r.id
-                                    AND t.kind='code_and_check'),0) AS round
-                          FROM runs r JOIN projects p ON p.id=r.project_id
-                          JOIN contracts c ON c.run_id=r.id AND c.version=r.contract_version
-                          WHERE (%s::uuid IS NULL OR r.id=%s::uuid)
-                          ORDER BY (r.status='awaiting_approval') DESC,r.updated_at DESC LIMIT 30""",
-                        (run_id, run_id)).fetchall()
-    result = []
-    for row in rows:
-        candidate = conn.execute("SELECT evidence FROM candidates WHERE id=%s", (row["current_candidate_id"],)).fetchone() if row["current_candidate_id"] else None
-        review = conn.execute("""SELECT v.result,v.disposition FROM reviews v JOIN attempts a ON a.id=v.attempt_id
-                               JOIN tasks t ON t.id=a.task_id WHERE t.run_id=%s
-                               ORDER BY v.created_at DESC,v.attempt_id DESC LIMIT 1""", (row["id"],)).fetchone()
-        checks = candidate["evidence"].get("checks", []) if candidate else []
-        summary = f"{sum(c['exit_code'] == 0 for c in checks)}/{len(checks)} checks passed" if checks else "Checks pending"
-        if review:
-            verdict = review["result"]["verdict"] if review["result"] else review["disposition"]
-            summary += f"; review: {verdict}"
-        else:
-            summary += "; review pending"
-        result.append({"id": str(row["id"]), "project": row["project_name"],
-                       "objective": row["body"]["objective"], "status": row["status"],
-                       "label": STATUS_LABELS.get(row["status"], row["status"]),
-                       "round": row["round"], "summary": summary,
-                       "stop_reason": row["stop_reason"], "updated_at": row["updated_at"].isoformat()})
-    return result
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -630,49 +581,20 @@ class Handler(BaseHTTPRequestHandler):
             expire_leases(conn)
             conn.commit()
             if path == "/requests":
-                project = conn.execute("SELECT * FROM projects WHERE id=%s", (form.get("project"),)).fetchone()
-                objective = form.get("objective", "").strip()
-                criteria = form.get("criteria", "").strip()
-                if not project or not objective or not criteria or len(objective) > 8000 or len(criteria) > 8000:
+                project = conn.execute("SELECT id FROM projects WHERE id=%s", (form.get("project"),)).fetchone()
+                if not project:
                     fail(400, "project, objective, and acceptance criteria required")
-                request_id, run_id = new_id(), new_id()
-                key = form.get("dedupe_key") or request_id
-                existing = conn.execute("SELECT r.id FROM runs r JOIN requests q ON q.id=r.request_id WHERE q.dedupe_key=%s", (key,)).fetchone()
-                if existing:
-                    conn.commit()
-                    return self.redirect("/runs/" + str(existing["id"]))
                 try:
                     revisions = int(form.get("revisions", "2"))
                 except ValueError:
                     fail(400, "invalid revision limit")
-                if revisions not in (0, 1, 2):
-                    fail(400, "revision limit must be 0–2")
-                body = {"objective": objective, "acceptance_criteria": criteria, "project_id": project["id"],
-                        "base_commit": project["base_commit"], "context_version": 1,
-                        "allowed_actions": ["code", "check", "review", "revise"], "checks": project["checks"],
-                        "check_hash": project["check_hash"], "reviewer": reviewer_identity(self.app.reviewer),
-                        "limits": {"seconds": RUN_SECONDS, "attempts": 8, "revisions": revisions},
-                        "delivery_condition": "ready_to_merge after passing checks and independent passing review"}
-                proposal = {"repository": project["name"], "base_commit": project["base_commit"],
-                            "allowed_actions": body["allowed_actions"], "check_plan": project["checks"],
-                            "limits": body["limits"], "delivery_condition": body["delivery_condition"]}
-                inserted = conn.execute("""INSERT INTO requests(id,dedupe_key,text,classification)
-                                            VALUES (%s,%s,%s,'proposal') ON CONFLICT (dedupe_key) DO NOTHING
-                                            RETURNING id""",
-                                        (request_id, key, objective + "\n\nAcceptance criteria:\n" + criteria)).fetchone()
-                if not inserted:
-                    existing = conn.execute("SELECT r.id FROM runs r JOIN requests q ON q.id=r.request_id WHERE q.dedupe_key=%s",
-                                            (key,)).fetchone()
-                    if existing:
-                        conn.commit()
-                        return self.redirect("/runs/" + str(existing["id"]))
-                    fail(409, "request is still being created")
-                conn.execute("""INSERT INTO runs(id,request_id,project_id,status,deadline)
-                                VALUES (%s,%s,%s,'awaiting_approval',now()+(%s || ' seconds')::interval)""",
-                             (run_id, request_id, project["id"], RUN_SECONDS))
-                conn.execute("INSERT INTO contracts(run_id,version,body,proposal) VALUES (%s,1,%s::jsonb,%s::jsonb)",
-                             (run_id, canonical(body), canonical(proposal)))
-                event(conn, run_id, "proposal_created", {"contract_version": 1, "request_id": request_id}, notify=True)
+                try:
+                    base, checks = github.fetch_base(self.app, project["id"])
+                except github.GitHubError as exc:
+                    fail(502, str(exc))
+                run_id, _ = create_run(conn, project["id"], base, checks, self.app.reviewer,
+                                       form.get("objective", "").strip(), form.get("criteria", "").strip(),
+                                       form.get("dedupe_key") or new_id(), revisions)
                 conn.commit()
                 return self.redirect("/runs/" + run_id)
             if path.startswith("/runs/"):
@@ -680,36 +602,18 @@ class Handler(BaseHTTPRequestHandler):
                 if len(parts) != 4:
                     fail(404, "not found")
                 run_id, action = parts[2], parts[3]
+                if action == "approve":
+                    decide_run(conn, run_id, form.get("version"), form.get("decision"), "authenticated_ui")
+                    conn.commit()
+                    return self.redirect("/runs/" + run_id)
+                if action == "cancel":
+                    cancel_run(conn, run_id)
+                    conn.commit()
+                    return self.redirect("/runs/" + run_id)
                 run = conn.execute("SELECT * FROM runs WHERE id=%s FOR UPDATE", (run_id,)).fetchone()
                 if not run:
                     fail(404, "run not found")
-                if action == "approve":
-                    if run["status"] != "awaiting_approval" or form.get("version") != str(run["contract_version"]):
-                        fail(409, "decision is stale")
-                    decision = form.get("decision")
-                    if decision not in ("approve", "deny"):
-                        fail(400, "specific decision required")
-                    conn.execute("""INSERT INTO approvals(id,run_id,contract_version,action,decision,source,target,target_state)
-                                    VALUES (%s,%s,%s,'code_check_review',%s,'authenticated_ui',%s,'awaiting_approval')""",
-                                 (new_id(), run_id, run["contract_version"], decision, run["project_id"]))
-                    event(conn, run_id, "approval_decided", {"action": "code_check_review", "decision": decision})
-                    if decision == "approve":
-                        conn.execute("""UPDATE runs SET status='queued',updated_at=now(),
-                                        deadline=now()+(%s || ' seconds')::interval WHERE id=%s""", (RUN_SECONDS, run_id))
-                        conn.execute("INSERT INTO tasks(id,run_id,kind,status) VALUES (%s,%s,'code_and_check','queued')", (new_id(), run_id))
-                        event(conn, run_id, "task_queued", {"kind": "code_and_check"})
-                    else:
-                        conn.execute("UPDATE runs SET status='denied',updated_at=now() WHERE id=%s", (run_id,))
-                elif action == "cancel":
-                    if run["status"] not in ("queued", "coding", "awaiting_review", "reviewing", "uncertain"):
-                        fail(409, "run cannot be cancelled")
-                    pending = run["status"] in ("coding", "reviewing", "uncertain")
-                    status = "cancelling" if pending else "cancelled"
-                    conn.execute("UPDATE runs SET status=%s,updated_at=now() WHERE id=%s", (status, run_id))
-                    conn.execute("""UPDATE tasks SET cancel_requested=true,status=%s WHERE run_id=%s
-                                    AND status IN ('queued','running','uncertain')""", (status, run_id))
-                    event(conn, run_id, "cancel_requested", {})
-                elif action == "retry":
+                if action == "retry":
                     if run["status"] not in ("uncertain", "failed"):
                         fail(409, "run cannot be retried")
                     task = conn.execute("""SELECT * FROM tasks WHERE run_id=%s AND status IN ('uncertain','failed')
@@ -1326,6 +1230,15 @@ class App:
         if bool(self.vapid_private_key) != bool(self.vapid_subject):
             raise ValueError("VAPID key and subject must be provided together")
         self.vapid_public_key = vapid_public_key(self.vapid_private_key) if self.vapid_private_key else None
+        github_config = github.load_config(args.github_config)
+        self.github_owners, self.github_token = github_config["owners"], github_config["token"]
+        self.git_base = github.GIT_BASE
+        # A rebuildable cache of GitHub repositories; it holds no authoritative state.
+        self.mirror_dir = self.artifact_dir / "mirrors"
+        self.mirror_dir.mkdir(exist_ok=True, mode=0o700)
+        decider_config = getattr(args, "decider_config", None)
+        self.decider_api = decider.API
+        self.decider = decider.load_config(decider_config) if decider_config else None
         telegram_config = getattr(args, "telegram_config", None)
         self.telegram_api = telegram.API
         self.telegram_token = self.telegram_user_id = None
@@ -1367,12 +1280,6 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
     init = sub.add_parser("init")
     init.add_argument("--dsn", required=True)
-    register = sub.add_parser("register-project")
-    register.add_argument("--dsn", required=True)
-    register.add_argument("--id", required=True)
-    register.add_argument("--name", required=True)
-    register.add_argument("--base", required=True)
-    register.add_argument("--checks", required=True, help="JSON file with objective checks")
     serve = sub.add_parser("serve")
     serve.add_argument("--dsn", required=True)
     serve.add_argument("--artifacts", required=True)
@@ -1386,19 +1293,14 @@ def main():
     serve.add_argument("--speech-scratch", help="private temporary directory outside artifacts and backups")
     serve.add_argument("--vapid-private-key", help="stable server-owned VAPID private key PEM")
     serve.add_argument("--vapid-subject", help="VAPID contact, e.g. mailto:operator@example.com")
+    serve.add_argument("--github-config", required=True, help="allowed GitHub owners and optional token JSON")
+    serve.add_argument("--decider-config", help="OpenRouter API key, model, and timeout JSON")
     serve.add_argument("--telegram-config", help="server-owned bot token and allowed Telegram user_id JSON")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
     if args.command == "init":
         initialize(args.dsn)
-    elif args.command == "register-project":
-        if not COMMIT_RE.fullmatch(args.base):
-            parser.error("base must be a full SHA-1 commit")
-        checks = check_config(json.loads(Path(args.checks).read_text()))
-        with connect(args.dsn) as conn:
-            conn.execute("INSERT INTO projects(id,name,base_commit,checks,check_hash) VALUES (%s,%s,%s,%s::jsonb,%s)",
-                         (args.id, args.name, args.base, canonical(checks), digest(checks)))
     else:
         if not all((args.password, args.worker_token, args.origin.startswith("https://"))):
             parser.error("password, worker token, and HTTPS origin required")

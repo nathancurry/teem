@@ -52,9 +52,11 @@ class SliceAcceptance(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
-        self.project_id = "test-" + os.urandom(4).hex()
-        self.repo = self.root / "repo"
-        self.repo.mkdir()
+        self.project_id = "teem-test/repo-" + os.urandom(4).hex()
+        # A local directory stands in for github.com; the repository is reached as <base>/<owner>/<name>.git.
+        self.git_base = self.root / "github"
+        self.repo = self.git_base / (self.project_id + ".git")
+        self.repo.mkdir(parents=True)
         run("git", "init", "-q", str(self.repo))
         (self.repo / "value.txt").write_text("before\n")
         (self.repo / "coder.py").write_text(
@@ -70,10 +72,12 @@ class SliceAcceptance(unittest.TestCase):
             "Path('value.txt').write_text('after\\n')\n"
         )
         (self.repo / "check.py").write_text("from pathlib import Path\nassert Path('value.txt').read_text() == 'after\\n'\n")
+        self.checks = [{"name": "content", "argv": ["/usr/bin/python3", "/workspace/check.py"]}]
+        (self.repo / ".teem").mkdir()
+        (self.repo / ".teem" / "checks.json").write_text(json.dumps(self.checks))
         run("git", "add", ".", cwd=self.repo)
         run("git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "base", cwd=self.repo)
         self.base = run("git", "rev-parse", "HEAD", cwd=self.repo)
-        self.checks = [{"name": "content", "argv": ["/usr/bin/python3", "/workspace/check.py"]}]
         from teem.common import canonical, digest
         self.reviewer_config = {"identity": "test-reviewer-v1", "instructions": "Review the exact candidate against the criteria.",
                                 "destination": "local", "timeout": 30}
@@ -92,12 +96,13 @@ class SliceAcceptance(unittest.TestCase):
                            "instructions_sha256": hashlib.sha256(self.reviewer_config["instructions"].encode()).hexdigest(),
                            "destination": "local", "timeout": 30, "executable": str(self.reviewer)}
         with connect(self.dsn) as conn:
-            conn.execute("INSERT INTO projects(id,name,base_commit,checks,check_hash) VALUES (%s,'Test',%s,%s::jsonb,%s)",
-                         (self.project_id, self.base, canonical(self.checks), digest(self.checks)))
-        projects = {self.project_id: {"repo": str(self.repo), "coder": ["/usr/bin/python3", "/workspace/coder.py"],
-                                      "checks": self.checks, "reviewer": reviewer_policy}}
+            conn.execute("INSERT INTO projects(id,name,status) VALUES (%s,'Test','proposed')", (self.project_id,))
+        policy = {"owners": ["teem-test"], "coder": ["/usr/bin/python3", "/workspace/coder.py"],
+                  "reviewer": reviewer_policy, "git_base": str(self.git_base)}
         config = self.root / "projects.json"
-        config.write_text(json.dumps(projects))
+        config.write_text(json.dumps(policy))
+        self.github_file = self.root / "github.json"
+        self.github_file.write_text(json.dumps({"owners": ["teem-test"]}))
         args = type("Args", (), {"url": "https://example.invalid", "token": "worker-secret", "worker_id": "worker",
                                     "state_dir": str(self.root / "worker"), "projects": str(config)})()
         self.worker_args = args
@@ -114,9 +119,11 @@ class SliceAcceptance(unittest.TestCase):
         args = type("Args", (), {"dsn": self.dsn, "artifacts": str(self.root / "artifacts"),
                                     "username": "user", "password": "password", "worker_id": "worker",
                                     "worker_token": "worker-secret", "origin": "https://teem.test",
-                                    "reviewer_config": str(self.reviewer_file)})()
+                                    "reviewer_config": str(self.reviewer_file),
+                                    "github_config": str(self.github_file)})()
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.server.app = App(args)
+        self.server.app.git_base = str(self.git_base)
         self.url = f"http://127.0.0.1:{self.server.server_port}"
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -256,12 +263,9 @@ class SliceAcceptance(unittest.TestCase):
         self.assertEqual((retrieved / "value.txt").read_text(), "after\n")
 
     def test_failed_checks_preserve_candidate_and_cancel_stops_dispatch(self):
-        from teem.common import canonical, digest
         self.checks = [{"name": "failing check", "argv": ["/usr/bin/false"]}]
-        self.worker.projects[self.project_id]["checks"] = self.checks
-        with connect(self.dsn) as conn:
-            conn.execute("UPDATE projects SET checks=%s::jsonb,check_hash=%s WHERE id=%s",
-                         (canonical(self.checks), digest(self.checks), self.project_id))
+        (self.repo / ".teem" / "checks.json").write_text(json.dumps(self.checks))
+        run("git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qam", "failing check", cwd=self.repo)
         status, headers, _ = self.browser("POST", "/requests", {"project": self.project_id,
             "objective": "Change value", "criteria": "value.txt contains after"})
         self.assertEqual(status, 303)
@@ -324,8 +328,6 @@ class SliceAcceptance(unittest.TestCase):
         run("git", "add", "coder.py", cwd=self.repo)
         run("git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "long coder", cwd=self.repo)
         base = run("git", "rev-parse", "HEAD", cwd=self.repo)
-        with connect(self.dsn) as conn:
-            conn.execute("UPDATE projects SET base_commit=%s WHERE id=%s", (base, self.project_id))
         status, headers, _ = self.browser("POST", "/requests", {"project": self.project_id,
             "objective": "Change value", "criteria": "value.txt contains after"})
         self.assertEqual(status, 303)
@@ -426,8 +428,6 @@ class SliceAcceptance(unittest.TestCase):
         run("git", "add", "coder.py", cwd=self.repo)
         run("git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "long coder", cwd=self.repo)
         base = run("git", "rev-parse", "HEAD", cwd=self.repo)
-        with connect(self.dsn) as conn:
-            conn.execute("UPDATE projects SET base_commit=%s WHERE id=%s", (base, self.project_id))
         status, headers, _ = self.browser("POST", "/requests", {"project": self.project_id,
             "objective": "Change value", "criteria": "value.txt contains after"})
         self.assertEqual(status, 303)
@@ -861,8 +861,6 @@ class SliceAcceptance(unittest.TestCase):
         run("git", "add", ".", cwd=self.repo)
         run("git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "review fixture", cwd=self.repo)
         base = run("git", "rev-parse", "HEAD", cwd=self.repo)
-        with connect(self.dsn) as conn:
-            conn.execute("UPDATE projects SET base_commit=%s WHERE id=%s", (base, self.project_id))
         self.reviewer.write_text(
             "#!/usr/bin/python3\nimport json\n"
             "from pathlib import Path\n"
@@ -977,7 +975,7 @@ class SliceAcceptance(unittest.TestCase):
                                      "model": model, "timeout": 600})
         self.reviewer_file.write_text(json.dumps(self.reviewer_config))
         self.server.app.reviewer = self.reviewer_config
-        self.worker.projects[self.project_id]["reviewer"].update(
+        self.worker.policy["reviewer"].update(
             {"identity": self.reviewer_config["identity"], "destination": "local-ollama",
              "model": model, "timeout": 600, "executable": str(installed)})
         status, headers, _ = self.browser("POST", "/requests", {"project": self.project_id,
@@ -998,9 +996,6 @@ class SliceAcceptance(unittest.TestCase):
         (self.repo / "large.txt").write_text("x" * (2 * 1024 * 1024 + 1))
         run("git", "add", "large.txt", cwd=self.repo)
         run("git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "large base", cwd=self.repo)
-        with connect(self.dsn) as conn:
-            conn.execute("UPDATE projects SET base_commit=%s WHERE id=%s",
-                         (run("git", "rev-parse", "HEAD", cwd=self.repo), self.project_id))
         path = self.propose()
         self.claim_and_execute()
         self.assertIsNone(self.worker.api.call("POST", "/worker/claim", {"worker_id": "worker",
@@ -1027,9 +1022,6 @@ class SliceAcceptance(unittest.TestCase):
         (self.repo / "check.py").write_text("from pathlib import Path\nassert Path('value.txt').read_text().startswith('after')\n")
         run("git", "add", ".", cwd=self.repo)
         run("git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "revision fixture", cwd=self.repo)
-        with connect(self.dsn) as conn:
-            conn.execute("UPDATE projects SET base_commit=%s WHERE id=%s",
-                         (run("git", "rev-parse", "HEAD", cwd=self.repo), self.project_id))
         capped = self.propose(revisions=1)
         for _ in range(4):
             self.claim_and_execute()
@@ -1137,7 +1129,7 @@ class SliceAcceptance(unittest.TestCase):
         self.reviewer_config["timeout"] = 1
         self.reviewer_file.write_text(json.dumps(self.reviewer_config))
         self.server.app.reviewer = self.reviewer_config
-        self.worker.projects[self.project_id]["reviewer"]["timeout"] = 1
+        self.worker.policy["reviewer"]["timeout"] = 1
         self.reviewer.write_text("#!/usr/bin/python3\nimport time\ntime.sleep(10)\n")
         self.reviewer.chmod(0o755)
         path = self.propose()
@@ -1161,9 +1153,6 @@ class SliceAcceptance(unittest.TestCase):
             "Path('value.txt').write_text('after\\n')\n")
         run("git", "add", "coder.py", cwd=self.repo)
         run("git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "failed revision fixture", cwd=self.repo)
-        with connect(self.dsn) as conn:
-            conn.execute("UPDATE projects SET base_commit=%s WHERE id=%s",
-                         (run("git", "rev-parse", "HEAD", cwd=self.repo), self.project_id))
         self.reviewer_verdict("changes_required")
         path = self.propose()
         first = self.claim_and_execute()
@@ -1187,9 +1176,6 @@ class SliceAcceptance(unittest.TestCase):
             "Path('value.txt').write_text('bad\\n' if contract.get('parent_candidate_id') else 'after\\n')\n")
         run("git", "add", "coder.py", cwd=self.repo)
         run("git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "failed check revision", cwd=self.repo)
-        with connect(self.dsn) as conn:
-            conn.execute("UPDATE projects SET base_commit=%s WHERE id=%s",
-                         (run("git", "rev-parse", "HEAD", cwd=self.repo), self.project_id))
         self.reviewer_verdict("changes_required")
         path = self.propose()
         self.claim_and_execute()
@@ -1213,9 +1199,6 @@ class SliceAcceptance(unittest.TestCase):
         (self.repo / "check.py").write_text("from pathlib import Path\nassert Path('value.txt').read_text().startswith('after')\n")
         run("git", "add", ".", cwd=self.repo)
         run("git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "attempt cap fixture", cwd=self.repo)
-        with connect(self.dsn) as conn:
-            conn.execute("UPDATE projects SET base_commit=%s WHERE id=%s",
-                         (run("git", "rev-parse", "HEAD", cwd=self.repo), self.project_id))
         self.reviewer_verdict("changes_required")
         path = self.propose(revisions=2)
 

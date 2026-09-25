@@ -13,6 +13,7 @@ MAX_OUTPUT_BYTES = 16 * 1024
 MAX_REVIEW_INPUT_BYTES = 24 * 1024
 REVIEW_SECONDS = 300
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+REPO_RE = re.compile(r"^[a-z0-9][a-z0-9-]*/[a-z0-9._-]+$")
 
 STATUS_LABELS = {"awaiting_approval": "Decision required", "queued": "Queued",
                  "coding": "Coding and checks", "awaiting_review": "Awaiting review",
@@ -20,6 +21,16 @@ STATUS_LABELS = {"awaiting_approval": "Decision required", "queued": "Queued",
                  "cancelling": "Cancellation unresolved", "failed": "Execution failed",
                  "checks_failed": "Checks failed", "blocked": "Stopped",
                  "ready_to_merge": "Ready to merge", "denied": "Denied", "cancelled": "Cancelled"}
+
+
+class ApiError(Exception):
+    def __init__(self, status, message):
+        self.status = status
+        self.message = message
+
+
+def fail(status, message):
+    raise ApiError(status, message)
 
 
 def canonical(value):
@@ -35,8 +46,8 @@ def new_id():
 
 
 def check_config(checks):
-    if not isinstance(checks, list) or not checks:
-        raise ValueError("at least one objective check is required")
+    if not isinstance(checks, list):
+        raise ValueError("checks must be a list")
     names = set()
     for item in checks:
         if not isinstance(item, dict) or set(item) != {"name", "argv"}:

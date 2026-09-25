@@ -1,4 +1,5 @@
 import argparse
+import base64
 import hashlib
 import http.client
 import json
@@ -15,7 +16,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .common import (CHECK_SECONDS, CODER_SECONDS, COMMIT_RE, MAX_OUTPUT_BYTES, PROTOCOL,
+from .common import (CHECK_SECONDS, CODER_SECONDS, COMMIT_RE, MAX_OUTPUT_BYTES, PROTOCOL, REPO_RE,
                      canonical, check_config, digest)
 
 
@@ -84,13 +85,16 @@ class Journal:
         return self.db.execute("SELECT id,generation,assignment,state,workspace,pid,result FROM attempts WHERE state!='done'").fetchall()
 
 
-def git(*args, cwd=None, env=None):
-    safe_env = {"PATH": "/usr/bin:/bin", "HOME": "/tmp", "GIT_CONFIG_NOSYSTEM": "1",
+def git(*args, cwd=None, env=None, timeout=30):
+    safe_env = {"PATH": "/usr/bin:/bin", "HOME": "/tmp", "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0",
                 "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_COUNT": "1",
                 "GIT_CONFIG_KEY_0": "core.hooksPath", "GIT_CONFIG_VALUE_0": "/dev/null"}
     if env:
         safe_env.update(env)
-    result = subprocess.run(["git", *args], cwd=cwd, env=safe_env, text=True, capture_output=True, timeout=30)
+    try:
+        result = subprocess.run(["git", *args], cwd=cwd, env=safe_env, text=True, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise WorkerError(f"git {' '.join(args[:2])} timed out") from None
     if result.returncode:
         raise WorkerError(f"git {' '.join(args[:2])} failed: {result.stderr[-1000:]}")
     return result.stdout.strip()
@@ -265,27 +269,48 @@ class Worker:
                 os.fsync(fd)
             finally:
                 os.close(fd)
-        self.projects = json.loads(Path(args.projects).read_text())
-        if not isinstance(self.projects, dict):
-            raise WorkerError("projects must be a JSON object")
-        for project in self.projects.values():
-            if set(project) != {"repo", "coder", "checks", "reviewer"}:
-                raise WorkerError("project needs repo, coder, checks, and reviewer")
-            check_config(project["checks"])
-            if not isinstance(project["coder"], list) or not project["coder"]:
-                raise WorkerError("coder command required")
-            if not Path(project["repo"]).is_absolute():
-                raise WorkerError("worker repository paths must be absolute")
-            reviewer = project["reviewer"]
-            if set(reviewer) not in ({"identity", "instructions_sha256", "destination", "timeout", "executable"},
-                                    {"identity", "instructions_sha256", "destination", "timeout", "executable", "model"}) or \
-               reviewer["destination"] not in ("local", "local-ollama") or \
-               (reviewer["destination"] == "local-ollama") != ("model" in reviewer) or \
-               ("model" in reviewer and (not isinstance(reviewer["model"], str) or not reviewer["model"])) or \
-               not Path(reviewer["executable"]).is_absolute() or \
-               not Path(reviewer["executable"]).is_file() or \
-               Path(reviewer["executable"]).resolve().is_relative_to(Path(project["repo"]).resolve()):
-                raise WorkerError("reviewer must be worker-installed outside the repository")
+        self.policy = json.loads(Path(args.projects).read_text())
+        if not isinstance(self.policy, dict) or not {"owners", "coder", "reviewer"} <= set(self.policy) or \
+           not set(self.policy) <= {"owners", "coder", "reviewer", "git_base", "token"}:
+            raise WorkerError("worker policy needs owners, coder, and reviewer, with optional git_base and token")
+        if not isinstance(self.policy["owners"], list) or not self.policy["owners"] or \
+           any(not isinstance(o, str) or not REPO_RE.fullmatch(o + "/x") for o in self.policy["owners"]):
+            raise WorkerError("owners must be lowercase GitHub owner names")
+        if not isinstance(self.policy["coder"], list) or not self.policy["coder"]:
+            raise WorkerError("coder command required")
+        reviewer = self.policy["reviewer"]
+        if set(reviewer) not in ({"identity", "instructions_sha256", "destination", "timeout", "executable"},
+                                {"identity", "instructions_sha256", "destination", "timeout", "executable", "model"}) or \
+           reviewer["destination"] not in ("local", "local-ollama") or \
+           (reviewer["destination"] == "local-ollama") != ("model" in reviewer) or \
+           ("model" in reviewer and (not isinstance(reviewer["model"], str) or not reviewer["model"])) or \
+           not Path(reviewer["executable"]).is_absolute() or \
+           not Path(reviewer["executable"]).is_file():
+            raise WorkerError("reviewer must be a worker-installed executable")
+        self.git_base = self.policy.get("git_base", "https://github.com")
+        (self.state_dir / "mirrors").mkdir(exist_ok=True, mode=0o700)
+
+    def mirror(self, repo):
+        """Fetch the worker's own copy of a repository; workspaces clone from it."""
+        path = self.state_dir / "mirrors" / (repo.replace("/", "__") + ".git")
+        env = {}
+        if self.policy.get("token"):
+            # The read-only token stays in the supervisor's git environment, never in a sandbox.
+            basic = base64.b64encode(("x-access-token:" + self.policy["token"]).encode()).decode()
+            env = {"GIT_CONFIG_COUNT": "2", "GIT_CONFIG_KEY_1": "http.extraHeader",
+                   "GIT_CONFIG_VALUE_1": "Authorization: Basic " + basic}
+        if path.exists():
+            git("fetch", "--prune", "origin", cwd=path, env=env, timeout=300)
+        else:
+            git("clone", "--mirror", "--quiet", f"{self.git_base}/{repo}.git", str(path), env=env, timeout=600)
+        return path
+
+    def repo_checks(self, mirror, base):
+        try:
+            git("cat-file", "-e", base + ":.teem/checks.json", cwd=mirror)
+        except WorkerError:
+            return []
+        return check_config(json.loads(git("show", base + ":.teem/checks.json", cwd=mirror)))
 
     def remaining(self, assignment, limit):
         deadline = datetime.fromisoformat(assignment["deadline"])
@@ -344,24 +369,32 @@ class Worker:
 
     def execute(self, assignment):
         attempt_id = assignment["attempt_id"]
-        project = self.projects.get(assignment["project_id"])
-        if not project:
+        project_id = assignment["project_id"]
+        if not REPO_RE.fullmatch(project_id) or project_id.split("/")[0] not in self.policy["owners"]:
             self.report_failure(assignment, "unconfigured project", policy=True)
             return
         contract = assignment["contract"]
-        if contract["project_id"] != assignment["project_id"] or \
+        if contract["project_id"] != project_id or \
            contract["allowed_actions"] != ["code", "check", "review", "revise"] or \
-           digest(project["checks"]) != contract["check_hash"] or project["checks"] != contract["checks"] or \
-           {k: v for k, v in project["reviewer"].items() if k != "executable"} != contract["reviewer"]:
+           {k: v for k, v in self.policy["reviewer"].items() if k != "executable"} != contract["reviewer"]:
             self.report_failure(assignment, "worker-local policy does not allow assignment", policy=True)
             return
         if assignment["kind"] == "review":
-            self.execute_review(assignment, project)
+            self.execute_review(assignment)
             return
-        repo = Path(project["repo"])
         base = contract["base_commit"]
         if not COMMIT_RE.fullmatch(base):
             self.report_failure(assignment, "invalid base commit", policy=True)
+            return
+        try:
+            repo = self.mirror(project_id)
+            checks = self.repo_checks(repo, base)
+        except (WorkerError, ValueError) as exc:
+            self.report_failure(assignment, "repository unavailable: " + str(exc)[:500])
+            return
+        # The server read the checks at the same base; a mismatch means the contract is not what the repository declares.
+        if checks != contract["checks"] or digest(checks) != contract["check_hash"]:
+            self.report_failure(assignment, "worker-local policy does not allow assignment", policy=True)
             return
         workspace = self.state_dir / ("attempt-" + attempt_id)
         self.journal.update(attempt_id, "preparing", workspace=str(workspace))
@@ -398,7 +431,7 @@ class Worker:
             contract_file.write_text(canonical(coding_input))
             with contract_file.open("rb") as f:
                 os.fsync(f.fileno())
-            code, output = restricted_run(project["coder"], workspace, contract_file,
+            code, output = restricted_run(self.policy["coder"], workspace, contract_file,
                                           self.remaining(assignment, CODER_SECONDS),
                                           lambda: self.heartbeat(assignment), self.journal, attempt_id)
             if code:
@@ -426,7 +459,7 @@ class Worker:
             ensure_lease()
             bundle_sha = hashlib.sha256(bundle.read_bytes()).hexdigest()
             results = []
-            for index, check in enumerate(project["checks"]):
+            for index, check in enumerate(checks):
                 ensure_lease()
                 check_workspace = self.state_dir / f"check-{attempt_id}-{index}"
                 git("clone", "--local", "--no-hardlinks", str(workspace), str(check_workspace))
@@ -466,7 +499,8 @@ class Worker:
             # The candidate and its checks remain in the journal for reconciliation.
             pass
 
-    def execute_review(self, assignment, project):
+    def execute_review(self, assignment):
+        reviewer = self.policy["reviewer"]
         attempt_id = assignment["attempt_id"]
         context = assignment["review_context"]
         if not context or digest(context["pack"]) != context["sha256"] or \
@@ -475,8 +509,8 @@ class Worker:
             return
         scratch = self.state_dir / ("review-" + attempt_id)
         context_file = self.state_dir / (attempt_id + ".context.json")
-        provenance = {"runner_identity": project["reviewer"]["identity"],
-                      "instructions_sha256": project["reviewer"]["instructions_sha256"],
+        provenance = {"runner_identity": reviewer["identity"],
+                      "instructions_sha256": reviewer["instructions_sha256"],
                       "context_sha256": context["sha256"], "started_at": datetime.now(timezone.utc).isoformat(),
                       "ended_at": None}
         try:
@@ -486,14 +520,14 @@ class Worker:
                 os.fsync(f.fileno())
             self.heartbeat(assignment)
             stop_bridge = None
-            if project["reviewer"]["destination"] == "local-ollama":
-                stop_bridge = ollama_bridge(scratch, context, project["reviewer"]["model"],
-                                            self.remaining(assignment, project["reviewer"]["timeout"]))
+            if reviewer["destination"] == "local-ollama":
+                stop_bridge = ollama_bridge(scratch, context, reviewer["model"],
+                                            self.remaining(assignment, reviewer["timeout"]))
             try:
                 code, output = restricted_run([], scratch, context_file,
-                                              self.remaining(assignment, project["reviewer"]["timeout"]),
+                                              self.remaining(assignment, reviewer["timeout"]),
                                               lambda: self.heartbeat(assignment), self.journal, attempt_id,
-                                              command=review_command(project["reviewer"]["executable"], scratch, context_file))
+                                              command=review_command(reviewer["executable"], scratch, context_file))
             finally:
                 if stop_bridge:
                     stop_bridge()
@@ -584,7 +618,8 @@ def main():
     parser.add_argument("--url", required=True)
     parser.add_argument("--token", required=True)
     parser.add_argument("--worker-id", required=True)
-    parser.add_argument("--projects", required=True, help="worker-local JSON project policy")
+    parser.add_argument("--projects", required=True,
+                        help="worker-local policy JSON: allowed GitHub owners, coder, reviewer, optional read token")
     parser.add_argument("--state-dir", required=True)
     Worker(parser.parse_args()).run()
 

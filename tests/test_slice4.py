@@ -59,12 +59,36 @@ def message(update_id, sender=USER, chat_type="private", **content):
                                                 "chat": {"id": sender, "type": chat_type}, **content}}
 
 
+class FakeModel(BaseHTTPRequestHandler):
+    def do_POST(self):
+        self.server.requests.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+        content, tool = self.server.responses.pop(0)
+        message = {"role": "assistant", "content": content}
+        if tool:
+            message["tool_calls"] = [{"id": "call", "type": "function",
+                                      "function": {"name": tool[0], "arguments": json.dumps(tool[1])}}]
+        data = json.dumps({"choices": [{"message": message}]}).encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, *_):
+        pass
+
+
+def callback(update_id, data, sender=USER):
+    return {"update_id": update_id, "callback_query": {"id": f"cb{update_id}", "from": {"id": sender},
+                                                       "message": {"chat": {"id": sender}}, "data": data}}
+
+
 class Slice4Acceptance(unittest.TestCase):
     setUpClass = classmethod(slice1.SliceAcceptance.setUpClass.__func__)
     tearDownClass = classmethod(slice1.SliceAcceptance.tearDownClass.__func__)
     tearDown = slice1.SliceAcceptance.tearDown
     stop_server = slice1.SliceAcceptance.stop_server
     browser = slice1.SliceAcceptance.browser
+    claim_and_execute = slice1.SliceAcceptance.claim_and_execute
     set_runner = slice3.Slice3Acceptance.set_runner
 
     def setUp(self):
@@ -76,13 +100,44 @@ class Slice4Acceptance(unittest.TestCase):
         threading.Thread(target=self.api.serve_forever, daemon=True).start()
         self.addCleanup(self.api.server_close)
         self.addCleanup(self.api.shutdown)
+        self.model = HTTPServer(("127.0.0.1", 0), FakeModel)
+        self.model.requests, self.model.responses = [], []
+        threading.Thread(target=self.model.serve_forever, daemon=True).start()
+        self.addCleanup(self.model.server_close)
+        self.addCleanup(self.model.shutdown)
+        self.use_decider = False
         slice1.SliceAcceptance.setUp(self)
+        with connect(self.dsn) as conn:
+            conn.execute("DELETE FROM telegram_outbox")
+            conn.execute("DELETE FROM telegram_updates")
 
     def start_server(self):
         slice3.Slice3Acceptance.start_server(self)
         app = self.server.app
         app.telegram_api = f"http://127.0.0.1:{self.api.server_port}"
         app.telegram_token, app.telegram_user_id = "123:secret", USER
+        if self.use_decider:
+            app.decider_api = f"http://127.0.0.1:{self.model.server_port}"
+            app.decider = {"api_key": "key", "model": "test-model", "timeout": 10}
+
+    def enable_decider(self):
+        self.use_decider = True
+        self.stop_server()
+        self.start_server()
+        self.worker.api.url = self.url
+
+    def deliver(self, *updates):
+        self.api.state["updates"] = list(updates)
+        telegram.poll_once(self.server.app, timeout=0)
+        self.drain()
+
+    def texts(self):
+        return [m["text"] for m in self.api.state["sent"]]
+
+    def run_row(self):
+        with connect(self.dsn) as conn:
+            return conn.execute("SELECT * FROM runs WHERE project_id=%s ORDER BY created_at DESC LIMIT 1",
+                                (self.project_id,)).fetchone()
 
     def drain(self):
         while telegram.process_one(self.server.app):
@@ -124,8 +179,7 @@ class Slice4Acceptance(unittest.TestCase):
                           "Send a text message or a voice note."])
         self.assertEqual({m["chat_id"] for m in state["sent"]}, {USER})
         with connect(self.dsn) as conn:
-            self.assertEqual(conn.execute("SELECT count(*) FROM requests").fetchone()["count"], 0)
-            self.assertEqual(conn.execute("SELECT count(*) FROM approvals").fetchone()["count"], 0)
+            self.assertEqual(conn.execute("SELECT count(*) FROM runs WHERE project_id=%s", (self.project_id,)).fetchone()["count"], 0)
             self.assertEqual(conn.execute("SELECT text FROM telegram_updates WHERE update_id=102").fetchone()["text"],
                              "approve change value")
 
@@ -148,8 +202,84 @@ class Slice4Acceptance(unittest.TestCase):
             "objective": "Change value", "criteria": "checked", "dedupe_key": "tg-check-in"})
         self.assertEqual(status, 303)
         self.drain()
-        self.assertEqual(state["sent"][-1]["text"],
-                         "Decision required: Test: Change value\nhttps://teem.test" + headers["Location"])
+        check_in = state["sent"][-1]
+        self.assertTrue(check_in["text"].startswith("Decision required: Test: Change value\nDone when: checked"))
+        self.assertTrue(check_in["text"].endswith("https://teem.test" + headers["Location"]))
+        run_id = headers["Location"].split("/")[-1]
+        self.assertEqual(check_in["reply_markup"]["inline_keyboard"][0][0]["callback_data"], f"r:{run_id}:1:a")
+
+    def test_voice_request_waits_for_button_and_reaches_ready(self):
+        self.enable_decider()
+        proposal = ("propose_run", {"repo": self.project_id.upper(), "objective": "Change value",
+                                    "acceptance_criteria": "value.txt contains after"})
+        self.model.responses = [("I can set that up.", proposal)]
+        voice = {"file_id": "v1", "duration": 1, "file_size": len(self.api.state["voice"])}
+        self.deliver(message(300, voice=voice))
+        run = self.run_row()
+        self.assertEqual((run["status"], run["project_id"]), ("awaiting_approval", self.project_id))
+        self.assertEqual(self.texts()[:2], ["Heard: approve change value", "I can set that up."])
+        self.assertEqual(self.api.state["sent"][2]["reply_markup"]["inline_keyboard"][0][0]["callback_data"],
+                         f"r:{run['id']}:1:a")
+        self.assertEqual(self.model.requests[0]["messages"][-1], {"role": "user", "content": "approve change value"})
+        with connect(self.dsn) as conn:
+            self.assertEqual(conn.execute("SELECT count(*) FROM approvals WHERE run_id=%s", (run["id"],)).fetchone()["count"], 0)
+            # Reprocessing the same update (a crash before commit) cannot create a second Run.
+            conn.execute("UPDATE telegram_updates SET processed_at=NULL WHERE update_id=300")
+        self.model.responses = [("Again.", proposal)]
+        self.drain()
+        with connect(self.dsn) as conn:
+            self.assertEqual(conn.execute("SELECT count(*) FROM runs WHERE project_id=%s", (self.project_id,)).fetchone()["count"], 1)
+
+        self.deliver(callback(301, f"r:{run['id']}:1:a", sender=999), callback(302, f"r:{run['id']}:2:a"),
+                     callback(303, f"r:{run['id']}:1:a"), callback(304, f"r:{run['id']}:1:d"))
+        self.assertIn("That decision no longer applies (decision is stale).", self.texts())
+        self.assertEqual(self.texts()[-2:], ["Approved. The run is queued.",
+                                             "That decision no longer applies (decision is stale)."])
+        answered = [c[1]["callback_query_id"] for c in self.api.state["calls"] if c[0] == "answerCallbackQuery"]
+        self.assertEqual(answered, ["cb302", "cb303", "cb304"])
+        with connect(self.dsn) as conn:
+            approval = conn.execute("SELECT decision,source FROM approvals WHERE run_id=%s", (run["id"],)).fetchone()
+        self.assertEqual((approval["decision"], approval["source"]), ("approve", "telegram_button"))
+        self.claim_and_execute()
+        self.claim_and_execute()
+        self.drain()
+        self.assertTrue(self.texts()[-1].startswith("Ready to merge: Test: Change value"))
+
+    def test_grant_starts_runs_without_asking_until_revoked(self):
+        self.enable_decider()
+        run_tool = ("propose_run", {"repo": self.project_id, "objective": "Change value",
+                                    "acceptance_criteria": "value.txt contains after"})
+        self.model.responses = [("", ("propose_project", {"repo": "someone-else/repo"})),
+                                ("Sure.", ("propose_project", {"repo": self.project_id}))]
+        self.deliver(message(400, text="let teem work on someone else's repo"),
+                     message(401, text="you can always work on my test repo"))
+        self.assertEqual(self.texts()[0], "I can only work on GitHub repositories owned by teem-test.")
+        with connect(self.dsn) as conn:
+            self.assertEqual(conn.execute("SELECT count(*) FROM projects WHERE id LIKE 'someone-else/%%'").fetchone()["count"], 0)
+            grant = conn.execute("SELECT grant_id FROM projects WHERE id=%s", (self.project_id,)).fetchone()["grant_id"]
+        prompt = self.api.state["sent"][-1]
+        self.assertTrue(prompt["text"].startswith(f"Allow Teem to start runs on {self.project_id}"))
+        self.assertEqual(prompt["reply_markup"]["inline_keyboard"][0][0]["callback_data"], f"p:{grant}:a")
+
+        self.model.responses = [("Starting.", run_tool)]
+        self.deliver(callback(402, f"p:{grant}:a"), message(403, text="change the value, approve it"))
+        run = self.run_row()
+        self.assertEqual(run["status"], "queued")
+        self.assertEqual(self.texts()[-1], f"Started on {self.project_id}: Change value")
+        with connect(self.dsn) as conn:
+            self.assertEqual(conn.execute("SELECT source FROM approvals WHERE run_id=%s", (run["id"],)).fetchone()["source"],
+                             f"project_grant:{grant}")
+        state = json.loads(self.model.requests[-1]["messages"][0]["content"].split("Current state:\n", 1)[1])
+        self.assertIn({"repo": self.project_id, "allowed_without_asking": True}, state["projects"])
+
+        self.model.responses = [("", ("cancel_run", {"run_id": str(run["id"])})), ("Queued for approval.", run_tool)]
+        self.deliver(message(404, text=f"/revoke {self.project_id}"), message(405, text="stop that run"),
+                     callback(406, f"p:{grant}:a"), message(407, text="change the value again"))
+        self.assertEqual(self.texts()[-5:-1], [f"Revoked. Teem will ask before each run on {self.project_id}.",
+                                               "Cancellation requested.", "That request no longer applies.",
+                                               "Queued for approval."])
+        self.assertTrue(self.texts()[-1].startswith("Decision required:"))
+        self.assertEqual(self.run_row()["status"], "awaiting_approval")
 
 
 if __name__ == "__main__":
