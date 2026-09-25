@@ -1,6 +1,6 @@
 # Vertical slice 3: phone dictation and notification hints
 
-Status: proposed increment after completed [slice 1](vertical-slice-1.md) and [slice 2](vertical-slice-2.md).
+Status: implemented increment after [slice 1](vertical-slice-1.md) and [slice 2](vertical-slice-2.md). Its phone interface and Web Push are superseded by [slice 4](vertical-slice-4.md); the transcription runner is reused.
 
 ## Outcome and scope
 
