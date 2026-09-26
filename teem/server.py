@@ -30,7 +30,7 @@ from .common import (
     fail,
     new_id,
 )
-from .db import connect, event, initialize
+from .db import connect, event, migrate
 from .review import ReviewInputError, build_context, validate_result
 from .speech import SpeechRunner
 from . import decider, github, stats, telegram
@@ -1293,8 +1293,9 @@ class App:
 def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
-    init = sub.add_parser("init")
-    init.add_argument("--dsn", required=True)
+    for command in ("init", "migrate"):
+        # init is kept as an alias; both create a fresh database or apply missing migrations.
+        sub.add_parser(command).add_argument("--dsn", required=True)
     serve = sub.add_parser("serve")
     serve.add_argument("--dsn", required=True)
     serve.add_argument("--artifacts", required=True)
@@ -1312,8 +1313,9 @@ def main():
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
-    if args.command == "init":
-        initialize(args.dsn)
+    if args.command in ("init", "migrate"):
+        applied = migrate(args.dsn)
+        print("applied: " + (", ".join(applied) if applied else "nothing; the schema is current"))
     else:
         if not all((args.password, args.worker_token, args.origin.startswith("https://"))):
             parser.error("password, worker token, and HTTPS origin required")

@@ -1,8 +1,0 @@
-services:
-  caddy:
-    image: caddy:2.10
-    restart: unless-stopped
-    network_mode: host
-    volumes:
-      - /mnt/storage/teem/caddy-config/Caddyfile:/etc/caddy/Caddyfile:ro
-      - /mnt/storage/teem/caddy-data:/data

@@ -11,11 +11,32 @@ Work starts only after you tap **Approve** on a proposal, or under a standing pr
 | Server (TrueNAS) | `teem-server`: PostgreSQL state, controller, artifact store, Telegram bot, decider, local voice transcription, GitHub publisher, and authenticated evidence pages |
 | Worker (development machine) | `teem-worker`: claims Attempts over outbound HTTPS and runs the implementer, checks, and reviewer in egress-restricted rootless Podman containers |
 
-## Server setup
+## Server setup (TrueNAS)
 
-Requirements: Python 3.11+, PostgreSQL, Git, and HTTPS termination in front of the loopback server. Voice notes also need FFmpeg/ffprobe, Bubblewrap, and a static `whisper-cli` from [whisper.cpp v1.9.4](https://github.com/ggml-org/whisper.cpp/releases/tag/v1.9.4). See [TrueNAS deployment](deploy/truenas/README.md) for a complete example.
+Clone the repository onto the NAS and run [`install/nas.sh`](install/nas.sh) as root. It is safe to re-run, and it is also how you update:
 
-Install with `uv sync` or `pip install .`. Initialize a fresh database with `teem-server init --dsn "$TEEM_DSN"`. Initialization is not a migration tool: apply [slice-3.sql](docs/architecture/slice-3.sql) to a slice-2 database, [slice-4.sql](docs/architecture/slice-4.sql) to a slice-3 database, and [v0.0.8.sql](docs/architecture/v0.0.8.sql) to a v0.0.7 database, each exactly once.
+```sh
+git clone https://github.com/nathancurry/teem.git /mnt/storage/teem/repo
+sudo /mnt/storage/teem/repo/install/nas.sh
+```
+
+The script:
+
+1. creates the `storage/teem` datasets it needs (existing directories are kept) and sets their ownership,
+2. generates the database password, the browser password, and the worker token without ever rotating existing ones,
+3. copies example configuration files for you to fill in,
+4. backs up the database, artifacts, and configuration,
+5. builds the server image from the checked-out commit,
+6. applies any database migrations,
+7. starts PostgreSQL and the server with [`install/compose.yaml`](install/compose.yaml) and checks that the server answers.
+
+On the first run it stops and asks for `TEEM_ORIGIN` (the HTTPS address, such as your `tailscale serve` URL) and for the Telegram, GitHub, and decider files. Voice notes turn on when `config/speech.json` exists; the image already includes FFmpeg and Bubblewrap.
+
+To update, check out a release tag and re-run the script: `git -C /mnt/storage/teem/repo fetch --tags && git -C /mnt/storage/teem/repo checkout vX.Y.Z && sudo /mnt/storage/teem/repo/install/nas.sh`. Then update the worker to the same tag.
+
+**Backups.** [`install/backup.sh`](install/backup.sh) writes a PostgreSQL dump plus artifacts and configuration archives to `/mnt/storage/teem/backups/<time>/`, keeping the newest 14. `nas.sh` runs it before every deploy. Schedule it daily as root under TrueNAS System → Advanced → Cron Jobs. Backups sit on the same pool, so replicate or cloud-sync the `backups` dataset off the NAS to survive a lost pool. Restore steps are at the top of the script.
+
+Outside TrueNAS, the server needs Python 3.11+, PostgreSQL, Git, and HTTPS termination in front of the loopback server; `teem-server migrate --dsn "$TEEM_DSN"` creates or upgrades the database.
 
 The server reads these configuration files:
 
@@ -49,27 +70,36 @@ The server reads these configuration files:
   {"executable": "/srv/teem/bin/whisper-cli", "executable_sha256": "<sha256>", "model": "/srv/teem/models/ggml-small.en.bin", "model_sha256": "<sha256>", "language": "en"}
   ```
 
-```sh
-teem-server serve --dsn "$TEEM_DSN" --artifacts /srv/teem/artifacts --username "$TEEM_USER" --password "$TEEM_PASSWORD" \
-  --worker-id worker-1 --worker-token "$TEEM_WORKER_TOKEN" --origin https://teem.example \
-  --reviewer-config reviewer.json --github-config github.json --decider-config decider.json --telegram-config telegram.json \
-  --speech-config speech.json --speech-scratch /srv/teem/speech-scratch
-```
-
 The server binds to `127.0.0.1:8765`. The HTTPS proxy must forward `Authorization` and `Origin`. Evidence pages use a sign-in form (so password managers can fill it) that sets a signed, HttpOnly session cookie for 30 days; changing the password signs every browser out. Basic authentication still works for scripts. Every browser POST must be same-origin. Workers use a separate bearer token and protocol version 3. The server needs outbound HTTPS to `api.telegram.org`, `openrouter.ai`, `github.com`, and `api.github.com`. It keeps rebuildable repository mirrors under `<artifacts>/mirrors`.
 
 ## Worker setup
 
-Follow [worker setup](deploy/worker/README.md) to build the agent and proxy images and to create the internal network and allowlisting proxy. Then install `teem/reviewer_codex.py` as an executable outside any repository, such as `/srv/teem/bin/reviewer-codex`, and write the worker policy:
+Run the worker as a dedicated user with rootless Podman (see [worker setup](deploy/worker/README.md) for creating the `teem` user). As that user, clone the repository to `~/src` and run [`install/worker.sh`](install/worker.sh). It is safe to re-run, and it is also how you update:
+
+```sh
+sudo machinectl shell teem@
+git clone https://github.com/nathancurry/teem.git ~/src && ~/src/install/worker.sh
+```
+
+The script:
+
+1. installs `teem-worker` and the reviewer wrappers,
+2. builds the agent and proxy images (tagged by their contents, so they rebuild only when they change),
+3. creates the internal network, and recreates the allowlisting proxy so allowlist edits take effect,
+4. points the policy at the right image,
+5. writes and restarts the `teem-worker` systemd user service.
+
+Before the first run, create these in `~/config`:
+
+- `worker.env` with `TEEM_URL=<server HTTPS address>`
+- `worker-token` with `TEEM_WORKER_TOKEN` from the NAS's `teem.env`
+- `policy.json`:
 
 ```json
 {
   "owners": ["your-github-user"],
   "token": "<read-only token for private repositories, optional>",
-  "image": "localhost/teem-agent:1",
-  "network": "teem-agents",
-  "proxy": "http://10.203.7.2:8888",
-  "coder": {"argv": ["teem-implement"], "env": {"CLAUDE_CODE_OAUTH_TOKEN": "<from claude setup-token>"}},
+  "coder": {"argv": ["teem-implement"], "env": {"CLAUDE_CODE_OAUTH_TOKEN": "<from claude setup-token>", "TEEM_CLAUDE_MODEL": "sonnet"}},
   "reviewer": {
     "identity": "openai-codex",
     "instructions_sha256": "<SHA-256 of the exact reviewer instructions>",
@@ -81,11 +111,9 @@ Follow [worker setup](deploy/worker/README.md) to build the agent and proxy imag
 }
 ```
 
-To review with Claude instead of Codex, install `teem/reviewer_claude.py` as the reviewer executable, give the reviewer role `CLAUDE_CODE_OAUTH_TOKEN` in its `env`, and use `"destination": "anthropic"` (and a matching identity, such as `claude-reviewer`) in both `reviewer.json` and the worker policy. Each review is still a fresh session that never sees the implementer's conversation, but the same model family writing and reviewing catches fewer shared blind spots. Create the Claude token with `claude setup-token`. It uses your Claude subscription and shares its usage limits with your interactive use. Log Codex in once with `HOME=/srv/teem/codex-home codex login --device-auth`. The reviewer mounts that directory as its home so Codex can refresh its token. Each role's `env` and `home` reach only that role's containers. Set `TEEM_CLAUDE_MODEL` or `TEEM_CODEX_MODEL` in a role's `env` to choose each role's default model. A request can also ask for the implementer model for one Run, such as "use Opus for this"; the contract records `sonnet` or `opus`, the Approve message shows it, and it overrides the worker default for that Run.
+The script fills in `image`, `network`, and `proxy`. `instructions_sha256` is the SHA-256 of the instructions in the NAS's `reviewer.json`: `python3 -c 'import hashlib,json;print(hashlib.sha256(json.load(open("reviewer.json"))["instructions"].encode()).hexdigest())'`. If an Attempt is running, the script asks before restarting the worker.
 
-```sh
-teem-worker --url https://teem.example --token-file /srv/teem/config/worker-token --worker-id worker-1 --projects policy.json --state-dir /srv/teem/worker-state
-```
+To review with Claude instead of Codex, install `teem/reviewer_claude.py` as the reviewer executable, give the reviewer role `CLAUDE_CODE_OAUTH_TOKEN` in its `env`, and use `"destination": "anthropic"` (and a matching identity, such as `claude-reviewer`) in both `reviewer.json` and the worker policy. Each review is still a fresh session that never sees the implementer's conversation, but the same model family writing and reviewing catches fewer shared blind spots. Create the Claude token with `claude setup-token`. It uses your Claude subscription and shares its usage limits with your interactive use. Log Codex in once with `HOME=/srv/teem/codex-home codex login --device-auth`. The reviewer mounts that directory as its home so Codex can refresh its token. Each role's `env` and `home` reach only that role's containers. Set `TEEM_CLAUDE_MODEL` or `TEEM_CODEX_MODEL` in a role's `env` to choose each role's default model. A request can also ask for the implementer model for one Run, such as "use Opus for this"; the contract records `sonnet` or `opus`, the Approve message shows it, and it overrides the worker default for that Run.
 
 ## How a Run works
 

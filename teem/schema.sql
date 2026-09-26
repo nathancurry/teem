@@ -156,3 +156,9 @@ CREATE TABLE IF NOT EXISTS telegram_outbox (
 );
 CREATE INDEX IF NOT EXISTS pending_telegram_outbox
     ON telegram_outbox(next_attempt_at) WHERE state='pending';
+
+-- Migrations in teem/migrations applied to this database; a fresh database records them all.
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    name text PRIMARY KEY,
+    applied_at timestamptz NOT NULL DEFAULT now()
+);

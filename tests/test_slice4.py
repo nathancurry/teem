@@ -14,7 +14,10 @@ from unittest.mock import patch
 from urllib.parse import quote, urlencode, urlparse
 
 from teem import github, telegram
-from teem.db import connect
+import psycopg
+from psycopg.conninfo import make_conninfo
+
+from teem.db import connect, migrate
 from teem.worker import container_command, restricted_run
 from teem.workflow import create_run
 from tests.test_slice import run
@@ -734,6 +737,28 @@ class Slice4Acceptance(unittest.TestCase):
         page = body.decode()
         self.assertIn("<td>sonnet</td>", page)
         self.assertIn("pull requests merged:", page)
+
+    def test_migrate_creates_fresh_databases_and_upgrades_untracked_ones(self):
+        name = "teem_migrate_" + os.urandom(4).hex()
+        with psycopg.connect(self.admin_dsn, autocommit=True) as admin:
+            admin.execute(f'CREATE DATABASE "{name}"')
+        try:
+            dsn = make_conninfo(self.admin_dsn, dbname=name)
+            self.assertEqual(migrate(dsn), ["schema.sql"])
+            self.assertEqual(migrate(dsn), [])
+            # A v0.0.7 database: the slice-4 schema without migration tracking or PR outcome columns.
+            with connect(dsn) as conn:
+                conn.execute("DROP TABLE schema_migrations")
+                conn.execute("ALTER TABLE runs DROP COLUMN pr_state, DROP COLUMN pr_closed_at, DROP COLUMN pr_checked_at")
+            self.assertEqual(migrate(dsn), ["0001_pr_outcomes.sql"])
+            with connect(dsn) as conn:
+                columns = {row["column_name"] for row in conn.execute(
+                    "SELECT column_name FROM information_schema.columns WHERE table_name='runs'")}
+            self.assertLessEqual({"pr_state", "pr_closed_at", "pr_checked_at"}, columns)
+            self.assertEqual(migrate(dsn), [])
+        finally:
+            with psycopg.connect(self.admin_dsn, autocommit=True) as admin:
+                admin.execute(f'DROP DATABASE "{name}" WITH (FORCE)')
 
 
 if __name__ == "__main__":

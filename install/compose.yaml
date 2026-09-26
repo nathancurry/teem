@@ -1,0 +1,70 @@
+name: teem
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: teem-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: teem
+      POSTGRES_USER: teem
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    volumes:
+      - /mnt/storage/teem/postgres:/var/lib/postgresql/data
+      - /mnt/storage/teem/config/postgres_password:/run/secrets/postgres_password:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U teem -d teem"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  server:
+    build:
+      context: ..
+      # The speech target adds FFmpeg and Bubblewrap; voice turns on only when speech.json exists.
+      target: speech
+    image: teem-server
+    pull_policy: never
+    container_name: teem-server
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    user: "568:568"
+    env_file: /mnt/storage/teem/config/teem.env
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - >-
+        set -- --dsn "$$TEEM_DSN" --artifacts /srv/teem/artifacts
+        --username "$$TEEM_USER" --password "$$TEEM_PASSWORD"
+        --worker-id worker-1 --worker-token "$$TEEM_WORKER_TOKEN" --origin "$$TEEM_ORIGIN"
+        --reviewer-config /srv/teem/config/reviewer.json --github-config /srv/teem/config/github.json
+        --decider-config /srv/teem/config/decider.json --telegram-config /srv/teem/config/telegram.json
+        --host 0.0.0.0;
+        if [ -f /srv/teem/config/speech.json ]; then
+        set -- "$$@" --speech-config /srv/teem/config/speech.json --speech-scratch /srv/teem/speech-scratch;
+        fi;
+        exec teem-server serve "$$@"
+    # Loopback only: tailscale serve publishes it to the tailnet.
+    ports:
+      - "127.0.0.1:8765:8765"
+    volumes:
+      - /mnt/storage/teem/artifacts:/srv/teem/artifacts
+      - /mnt/storage/teem/config:/srv/teem/config:ro
+      - /mnt/storage/teem/speech:/srv/teem/speech:ro
+    # Recordings stay in memory, outside artifacts and backups.
+    tmpfs:
+      - /srv/teem/speech-scratch:rw,nosuid,nodev,size=512m,uid=568,gid=568,mode=0700
+
+  # One-shot, run by install/nas.sh before the server starts: create or upgrade the schema.
+  migrate:
+    image: teem-server
+    pull_policy: never
+    profiles: [tools]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    user: "568:568"
+    env_file: /mnt/storage/teem/config/teem.env
+    entrypoint: ["/bin/sh", "-ec"]
+    command: ['exec teem-server migrate --dsn "$$TEEM_DSN"']

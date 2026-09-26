@@ -1,4 +1,4 @@
-# Worker host setup
+# Worker host
 
 The worker runs on a development machine, not on TrueNAS. Each coder, check, and review subprocess runs in a disposable rootless Podman container:
 
@@ -8,35 +8,30 @@ The worker runs on a development machine, not on TrueNAS. Each coder, check, and
 
 A container does not die with the worker. If the worker crashes, its running container continues until its Podman timeout. On the next start, the worker removes containers labeled with that attempt before reconciling it, so no attempt ever runs twice.
 
-## One-time setup
+[`install/worker.sh`](../../install/worker.sh) builds the images in this directory, creates the network and proxy, and installs the service. The one-time setup below needs root, so the script doesn't do it.
 
-Run these commands as the user that runs `teem-worker`. Rootless Podman needs cgroup v2 with memory, CPU, and PID controllers delegated to that user; recent Fedora and Debian releases do this by default.
+## One-time user setup (as root)
+
+A dedicated user keeps the agents' containers and credentials apart from your own account. Rootless Podman needs cgroup v2 with memory, CPU, and PID controllers delegated to the user; recent Fedora and Debian releases do this by default.
 
 ```sh
-cd deploy/worker
-podman build -t localhost/teem-agent:1 -f agent.Containerfile .
-podman build -t localhost/teem-proxy:1 -f proxy.Containerfile .
-podman network create --internal --disable-dns --subnet 10.203.7.0/24 teem-agents
-mkdir -p ~/.config/teem && cp allowlist.example ~/.config/teem/allowlist
-podman run -d --name teem-proxy --restart always \
-  --network podman --network teem-agents:ip=10.203.7.2 \
-  -v ~/.config/teem/allowlist:/etc/tinyproxy/allow:ro,z localhost/teem-proxy:1
+sudo useradd -m -d /srv/teem -s /bin/bash teem
+sudo loginctl enable-linger teem          # keeps the worker running without a login
+# SELinux (Fedora): label /srv/teem like a home directory, including Podman's storage.
+sudo semanage fcontext -a -e /home/$USER /srv/teem && sudo restorecon -RF /srv/teem
 ```
 
-The allowlist holds one extended regular expression per line, matched against the host of each HTTPS tunnel. Add the registries your projects' checks and installs need. Everything else, including LAN addresses and plain HTTP, is refused. Denials appear in `podman logs teem-proxy`. To keep the proxy running across reboots, generate a systemd user unit or use a Quadlet, and enable lingering for the user.
+Then log in as that user with `sudo machinectl shell teem@` (not `sudo -u`, which lacks the user session that `systemctl --user` and Podman need), and follow the worker steps in the [main README](../../README.md#worker-setup).
 
-The worker's policy file names the image, network, and proxy:
+## Credentials
 
-```json
-{
-  "owners": ["your-github-user"],
-  "token": "<optional read-only token for private repositories>",
-  "image": "localhost/teem-agent:1",
-  "network": "teem-agents",
-  "proxy": "http://10.203.7.2:8888",
-  "coder": ["..."],
-  "reviewer": {"...": "see the main README"}
-}
-```
+- **Claude Code:** run `claude setup-token` anywhere you are signed in, and put the token in the coder's `env` in `policy.json`.
+- **Codex:** sign in once into the reviewer's home directory:
+  ```sh
+  podman run --rm -it -v /srv/teem/codex-home:/home/agent:z -e HOME=/home/agent \
+    --userns=keep-id <agent image from policy.json> codex login --device-auth
+  ```
 
-Rebuild the agent image deliberately to update the pinned CLI versions, give it a new tag, and change `image` in the policy file.
+## Allowlist
+
+`~/config/allowlist` holds one extended regular expression per line, matched against the host of each HTTPS tunnel. Add the registries your projects' checks and installs need; everything else, including LAN addresses and plain HTTP, is refused. Re-run `install/worker.sh` after editing it. Denials appear in `podman logs teem-proxy 2>&1 | grep refused`.
