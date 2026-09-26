@@ -134,13 +134,13 @@ def queue_message(conn, text, run_id=None):
     conn.execute("INSERT INTO telegram_outbox(run_id,text,state) VALUES (%s,%s,'pending')", (run_id, text))
 
 
-def prepare(app, text):
+def prepare(app, text, spoken=False):
     """Ask the decider and do any network work its action needs, outside a transaction.
 
     Returns (replies, action) where action is None or a dict applied by apply_action.
     """
     try:
-        reply, tool = decider.decide(app, text)
+        reply, tool = decider.decide(app, text, spoken)
     except decider.DeciderError as exc:
         return [f"The decider is unavailable ({exc}). Please try again."], None
     replies = [reply] if reply else []
@@ -176,8 +176,11 @@ def ensure_project(conn, repo):
     return conn.execute("SELECT * FROM projects WHERE id=%s FOR UPDATE", (repo,)).fetchone()
 
 
-def apply_action(conn, app, update_id, action):
-    """Apply a validated action inside the update's processing transaction. Returns replies."""
+def apply_action(conn, app, dedupe_key, action, spoken=False):
+    """Apply a validated action inside the message's processing transaction. Returns replies.
+
+    dedupe_key identifies the message, so reprocessing it can never create a second Run.
+    """
     kind = action["kind"]
     if kind == "revoke":
         repo = github.normalize_repo(action["repo"], app.github_owners)
@@ -204,14 +207,17 @@ def apply_action(conn, app, update_id, action):
         try:
             with conn.transaction():
                 run_id, _ = create_run(conn, action["repo"], action["base"], action["checks"], app.reviewer,
-                                       action["objective"], action["criteria"], f"tg:{update_id}",
+                                       action["objective"], action["criteria"], dedupe_key,
                                        model=action["model"], decider_model=app.decider["model"])
         except psycopg.errors.UniqueViolation:
             return [f"A run is already active on {action['repo']}."]
         except ApiError as exc:
             return [f"I couldn't create that run: {exc.message}."]
         status = conn.execute("SELECT status FROM runs WHERE id=%s", (run_id,)).fetchone()["status"]
-        return [f"Started on {action['repo']}: {action['objective']}"] if status == "queued" else []
+        if status == "queued":
+            return [f"Started on {action['repo']}: {action['objective']}"]
+        # In Telegram the Decision message follows at once; a spoken reply has to say where it went.
+        return ["It's waiting for your approval in Telegram."] if spoken else []
     if kind == "cancel_run":
         try:
             with conn.transaction():
@@ -342,7 +348,7 @@ def process_one(app):
             for reply in replies:
                 queue_message(conn, reply)
             if action:
-                for reply in apply_action(conn, app, row["update_id"], action):
+                for reply in apply_action(conn, app, f"tg:{row['update_id']}", action):
                     queue_message(conn, reply)
     return True
 

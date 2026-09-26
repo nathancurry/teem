@@ -142,6 +142,16 @@ If queued work waits 10 minutes while the worker has been silent for five, the b
 
 The **Stats** page (`/stats`) covers the last 30 days: outcomes, how often the first review passed, revisions per Run, how many of Teem's pull requests you merged, and why Runs stopped, broken down by implementer and decider model. The publisher checks open Teem PRs every 10 minutes to record whether they were merged or closed. Workers record the implementer and reviewer model per attempt from the Run's choice or the role's `TEEM_CLAUDE_MODEL`/`TEEM_CODEX_MODEL`; set these explicitly so the page doesn't show "default".
 
+## Voice
+
+Any app that can use an OpenAI-compatible server can talk to the decider, for example a voice app that transcribes and speaks on the phone (such as Airgap):
+
+- **Base URL:** your Teem address plus `/v1`, e.g. `https://truenas.example.ts.net:8443/v1`
+- **Model:** `teem`
+- **API key:** `TEEM_CHAT_KEY` from the NAS's `teem.env`, which `nas.sh` generates
+
+Each message is one decider turn in the same conversation as Telegram, with the same tools. Replies are kept short and speakable. Approval requests and their buttons still go to Telegram, and nothing said by voice approves work. The key only reaches this endpoint: it can't sign in to the web pages or act as the worker. Streaming and non-streaming requests both work.
+
 ## Tests
 
 The acceptance suite uses a disposable PostgreSQL admin connection and rootless Podman. It builds test-tagged agent and proxy images from `deploy/worker` when they are missing, and creates a temporary internal network and proxy per test class. The agent tests run the real `teem-implement` and `reviewer_codex.py` in the agent image, with fake `claude` and `codex` executables on `PATH`, so no credentials are needed. Telegram, OpenRouter, and the GitHub API are fake local endpoints. Git pushes go to a local repository directory.

@@ -237,6 +237,7 @@ class Slice4Acceptance(unittest.TestCase):
         app.telegram_api = f"http://127.0.0.1:{self.api.server_port}"
         app.telegram_token, app.telegram_user_id = "123:secret", USER
         app.github_api, app.github_token = f"http://127.0.0.1:{self.github_api.server_port}", "test-token"
+        app.chat_key = "chat-secret"
         if self.use_decider:
             app.decider_api = f"http://127.0.0.1:{self.model.server_port}"
             app.decider = {"api_key": "key", "model": "test-model", "timeout": 10}
@@ -576,10 +577,10 @@ class Slice4Acceptance(unittest.TestCase):
         self.assertEqual(self.github_api.pulls, [])
         self.assertEqual(run("git", "branch", "--list", "teem/*", cwd=self.repo), "")
 
-    def request(self, method, path, body=None, headers=None):
+    def request(self, method, path, body=None, headers=None, raw=False):
         parsed = urlparse(self.url)
         conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=10)
-        conn.request(method, path, urlencode(body) if body is not None else None,
+        conn.request(method, path, body if raw else (urlencode(body) if body is not None else None),
                      {"Content-Type": "application/x-www-form-urlencoded", **(headers or {})})
         response = conn.getresponse()
         result = response.status, response.headers, response.read()
@@ -750,7 +751,8 @@ class Slice4Acceptance(unittest.TestCase):
             with connect(dsn) as conn:
                 conn.execute("DROP TABLE schema_migrations")
                 conn.execute("ALTER TABLE runs DROP COLUMN pr_state, DROP COLUMN pr_closed_at, DROP COLUMN pr_checked_at")
-            self.assertEqual(migrate(dsn), ["0001_pr_outcomes.sql"])
+                conn.execute("DROP TABLE chat_turns")
+            self.assertEqual(migrate(dsn), ["0001_pr_outcomes.sql", "0002_chat_turns.sql"])
             with connect(dsn) as conn:
                 columns = {row["column_name"] for row in conn.execute(
                     "SELECT column_name FROM information_schema.columns WHERE table_name='runs'")}
@@ -787,6 +789,42 @@ class Slice4Acceptance(unittest.TestCase):
         self.claim_and_execute()
         self.assertEqual(self.run_status(run_id)["status"], "ready_to_merge")
         self.assertIsNotNone(first)
+
+    def chat(self, body, key="chat-secret", method="POST", path="/v1/chat/completions"):
+        return self.request(method, path, json.dumps(body) if body is not None else None,
+                            {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, raw=True)
+
+    def test_voice_app_talks_to_the_decider_but_approvals_stay_in_telegram(self):
+        self.enable_decider()
+        self.assertEqual(self.chat(None, key="wrong", method="GET", path="/v1/models")[0], 401)
+        status, _, body = self.chat(None, method="GET", path="/v1/models")
+        self.assertEqual((status, json.loads(body)["data"][0]["id"]), (200, "teem"))
+        proposal = ("propose_run", {"repo": self.project_id, "objective": "Change value",
+                                    "acceptance_criteria": "value.txt contains after"})
+        self.model.responses = [("I'll set that up. Details at https://teem.test/runs/x", proposal),
+                                ("Nothing is running right now.", None)]
+        spoken = {"model": "teem", "messages": [{"role": "system", "content": "You are a helpful assistant."},
+                                                {"role": "user", "content": "change the value"}]}
+        status, _, body = self.chat(spoken)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["choices"][0]["message"]["content"],
+                         "I'll set that up. Details at It's waiting for your approval in Telegram.")
+        self.assertIn("read aloud", self.model.requests[-1]["messages"][0]["content"])
+        self.drain()
+        decision = self.api.state["sent"][-1]
+        self.assertTrue(decision["text"].startswith("Decision required: Test: Change value"))
+        self.assertIn("reply_markup", decision)
+        self.assertEqual(self.run_row()["status"], "awaiting_approval")
+        status, headers, body = self.chat({**spoken, "stream": True,
+                                           "messages": [{"role": "user", "content": [{"type": "text", "text": "status?"}]}]})
+        self.assertEqual((status, headers["Content-Type"]), (200, "text/event-stream"))
+        events = [line.removeprefix("data: ") for line in body.decode().split("\n\n") if line]
+        self.assertEqual(events[-1], "[DONE]")
+        self.assertEqual(json.loads(events[0])["choices"][0]["delta"]["content"], "Nothing is running right now.")
+        history = [m["content"] for m in self.model.requests[-1]["messages"][1:]]
+        self.assertIn("change the value", history, "voice turns join the shared conversation")
+        self.assertEqual(self.browser("POST", f"/runs/{self.run_row()['id']}/approve",
+                                      {"version": "1", "decision": "deny"})[0], 303)
 
 
 if __name__ == "__main__":

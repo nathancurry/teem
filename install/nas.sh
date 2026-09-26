@@ -67,6 +67,7 @@ env_ensure "$NAS_ENV" TEEM_DSN "postgresql://teem:$db_password_encoded@postgres:
 env_ensure "$NAS_ENV" TEEM_USER operator
 env_ensure "$NAS_ENV" TEEM_PASSWORD "$(random_secret)"
 env_ensure "$NAS_ENV" TEEM_WORKER_TOKEN "$(random_secret)"
+env_ensure "$NAS_ENV" TEEM_CHAT_KEY "$(random_secret)"
 [ -n "$(env_get "$NAS_ENV" TEEM_ORIGIN)" ] || die "add the server's HTTPS address to $NAS_ENV, for example:
        TEEM_ORIGIN=https://truenas.example.ts.net:8443
        Then re-run."
@@ -119,6 +120,8 @@ cat <<EOF
 Teem $(git -C "$REPO_DIR" describe --tags --always --dirty) is up on 127.0.0.1:$NAS_PORT.
 - Sign in as $(env_get "$NAS_ENV" TEEM_USER); the password is TEEM_PASSWORD in $NAS_ENV.
 - The worker needs TEEM_WORKER_TOKEN from $NAS_ENV in its config/worker-token file.
+- Voice apps (OpenAI-compatible): base URL $(env_get "$NAS_ENV" TEEM_ORIGIN)/v1, model "teem",
+  API key TEEM_CHAT_KEY from $NAS_ENV.
 - Run install/backup.sh daily: TrueNAS UI -> System -> Advanced -> Cron Jobs, as root:
     $REPO_DIR/install/backup.sh
 - Then update the worker to the same version with install/worker.sh.

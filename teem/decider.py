@@ -90,7 +90,9 @@ def history(conn):
                                WHERE processed_at IS NOT NULL AND text IS NOT NULL
                                UNION ALL
                                SELECT 'assistant',text,created_at FROM telegram_outbox
-                               WHERE text IS NOT NULL AND state<>'abandoned') m
+                               WHERE text IS NOT NULL AND state<>'abandoned'
+                               UNION ALL
+                               SELECT role,text,created_at FROM chat_turns) m
                            ORDER BY at DESC LIMIT %s""", (HISTORY_MESSAGES,)).fetchall()
     return [{"role": row["role"], "content": row["text"]} for row in reversed(rows)]
 
@@ -104,11 +106,19 @@ def current_state(conn, owners):
             "recent_runs": runs}
 
 
-def decide(app, text):
+SPOKEN = """
+
+This message arrived by voice and your reply will be read aloud. Reply in one or two short spoken \
+sentences: no links, lists, markdown, IDs, or symbols. Approval requests and their buttons are \
+in Telegram."""
+
+
+def decide(app, text, spoken=False):
     """Return (reply_text, tool) where tool is None or (name, arguments)."""
     with connect(app.dsn) as conn:
         messages = [{"role": "system",
-                     "content": SYSTEM + "\n\nCurrent state:\n" + json.dumps(current_state(conn, app.github_owners))},
+                     "content": SYSTEM + (SPOKEN if spoken else "") + "\n\nCurrent state:\n" +
+                                json.dumps(current_state(conn, app.github_owners))},
                     *history(conn), {"role": "user", "content": text}]
     body = {"model": app.decider["model"], "messages": messages, "tools": TOOLS, "max_tokens": 1500}
     request = urllib.request.Request(app.decider_api + "/chat/completions", data=json.dumps(body).encode(),

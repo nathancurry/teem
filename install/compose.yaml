@@ -40,7 +40,7 @@ services:
         --worker-id worker-1 --worker-token "$$TEEM_WORKER_TOKEN" --origin "$$TEEM_ORIGIN"
         --reviewer-config /srv/teem/config/reviewer.json --github-config /srv/teem/config/github.json
         --decider-config /srv/teem/config/decider.json --telegram-config /srv/teem/config/telegram.json
-        --host 0.0.0.0;
+        --chat-key "$$TEEM_CHAT_KEY" --host 0.0.0.0;
         if [ -f /srv/teem/config/speech.json ]; then
         set -- "$$@" --speech-config /srv/teem/config/speech.json --speech-scratch /srv/teem/speech-scratch;
         fi;

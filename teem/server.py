@@ -33,7 +33,7 @@ from .common import (
 from .db import connect, event, migrate
 from .review import ReviewInputError, build_context, validate_result
 from .speech import SpeechRunner
-from . import decider, github, stats, telegram
+from . import chat, decider, github, stats, telegram
 from .workflow import (cancel_run, create_run, decide_run, reviewer_identity, run_cancelled, status_rows,
                        run_limit, stop_run, task_attempt_limit)
 
@@ -259,6 +259,40 @@ class Handler(BaseHTTPRequestHandler):
                 fail(403, "same-origin decision required")
         return True
 
+    def chat_request(self, path):
+        """The OpenAI-compatible API for voice apps, authenticated by its own chat-only key.
+
+        It uses a bearer key rather than the browser session, so it needs no same-origin check:
+        a browser never sends this key on its own.
+        """
+        if not self.app.chat_key:
+            fail(404, "the chat endpoint is not enabled")
+        if not hmac.compare_digest(self.headers.get("Authorization", ""), "Bearer " + self.app.chat_key):
+            fail(401, "chat API key required")
+        if self.command == "GET" and path == "/v1/models":
+            self.respond(200, chat.models())
+            return
+        if self.command != "POST" or path != "/v1/chat/completions":
+            fail(404, "not found")
+        try:
+            body = json.loads(self.body(1024 * 1024))
+        except (ValueError, UnicodeDecodeError):
+            fail(400, "invalid JSON")
+        text = chat.latest_user_text(body)
+        if not text:
+            fail(400, "a user message is required")
+        reply = chat.turn(self.app, text)
+        if not body.get("stream"):
+            self.respond(200, chat.completion(reply))
+            return
+        data = chat.stream_events(reply).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def session_signature(self, expires):
         # Derived from the password, so changing the password signs every browser out.
         key = hmac.new(self.app.password.encode(), b"teem-session", hashlib.sha256).digest()
@@ -327,6 +361,9 @@ class Handler(BaseHTTPRequestHandler):
             if path in ("/manifest.webmanifest", "/icon.svg", "/icon-192.png", "/icon-512.png", "/phone.js"):
                 self.static_get(path)
                 return
+            if path.startswith("/v1/"):
+                self.chat_request(path)
+                return
             if path == "/login":
                 next_path = parse_qs(urlparse(self.path).query).get("next", ["/"])[0]
                 self.respond(200, login_page(next_path), "text/html; charset=utf-8")
@@ -385,6 +422,8 @@ class Handler(BaseHTTPRequestHandler):
                 if not self.auth(worker=True):
                     return
                 self.worker_post(path)
+            elif path.startswith("/v1/"):
+                self.chat_request(path)
             elif path == "/login":
                 self.login()
             else:
@@ -1238,6 +1277,7 @@ class App:
         decider_config = getattr(args, "decider_config", None)
         self.decider_api = decider.API
         self.decider = decider.load_config(decider_config) if decider_config else None
+        self.chat_key = getattr(args, "chat_key", None)
         telegram_config = getattr(args, "telegram_config", None)
         self.telegram_api = telegram.API
         self.telegram_token = self.telegram_user_id = None
@@ -1310,6 +1350,7 @@ def main():
     serve.add_argument("--speech-scratch", help="private temporary directory outside artifacts and backups")
     serve.add_argument("--github-config", required=True, help="allowed GitHub owners and optional token JSON")
     serve.add_argument("--decider-config", help="OpenRouter API key, model, and timeout JSON")
+    serve.add_argument("--chat-key", help="bearer key for the OpenAI-compatible chat endpoint used by voice apps")
     serve.add_argument("--telegram-config", help="server-owned bot token and allowed Telegram user_id JSON")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8765)

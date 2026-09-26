@@ -162,3 +162,11 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
     name text PRIMARY KEY,
     applied_at timestamptz NOT NULL DEFAULT now()
 );
+
+-- Turns from the OpenAI-compatible chat endpoint; see migrations/0002_chat_turns.sql.
+CREATE TABLE IF NOT EXISTS chat_turns (
+    id bigserial PRIMARY KEY,
+    role text NOT NULL CHECK (role IN ('user','assistant')),
+    text text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
