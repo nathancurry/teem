@@ -224,7 +224,7 @@ class Worker:
         reviewer = self.policy["reviewer"]
         required = {"identity", "instructions_sha256", "destination", "timeout", "executable"}
         if not required <= set(reviewer) <= required | {"env", "home"} or \
-           reviewer["destination"] not in ("local", "openai") or not valid_role_extras(reviewer) or \
+           reviewer["destination"] not in ("local", "openai", "anthropic") or not valid_role_extras(reviewer) or \
            not Path(reviewer["executable"]).is_absolute() or \
            not Path(reviewer["executable"]).is_file():
             raise WorkerError("reviewer must be a worker-installed executable")

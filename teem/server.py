@@ -1170,7 +1170,7 @@ class App:
         if not self.reviewer or set(self.reviewer) != {"identity", "instructions", "destination", "timeout"} or \
            not isinstance(self.reviewer["identity"], str) or not self.reviewer["identity"] or \
            not isinstance(self.reviewer["instructions"], str) or not self.reviewer["instructions"] or \
-           self.reviewer["destination"] not in ("local", "openai") or \
+           self.reviewer["destination"] not in ("local", "openai", "anthropic") or \
            type(self.reviewer["timeout"]) is not int or \
            not 1 <= self.reviewer["timeout"] <= 1800:
             raise ValueError("invalid server reviewer configuration")

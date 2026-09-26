@@ -22,6 +22,21 @@ import json, sys
 from pathlib import Path
 prompt = sys.argv[sys.argv.index('-p') + 1]
 assert '--dangerously-skip-permissions' in sys.argv
+if '--json-schema' in sys.argv:
+    schema = json.loads(sys.argv[sys.argv.index('--json-schema') + 1])
+    numbers = schema['properties']['findings']['items']['properties']['criterion_number']['enum']
+    if Path('/workspace/value.txt').read_text() == 'after\\n':
+        judgment = {'verdict': 'changes_required', 'summary': 'Value is not reviewed', 'uncertainties': [],
+                    'findings': [{'criterion_number': numbers[1], 'description': 'value.txt must say reviewed',
+                                  'evidence': [{'kind': 'source', 'path': 'value.txt', 'start_line': 1,
+                                                'end_line': 1, 'check_name': None}],
+                                  'reproduction': {'path': 'test_probe.py', 'content': 'assert False',
+                                                   'output': 'AssertionError: plain after'}}]}
+    else:
+        judgment = {'verdict': 'pass', 'summary': 'Reviewed value present', 'findings': [], 'uncertainties': []}
+    print(json.dumps({'type': 'result', 'is_error': False, 'result': json.dumps(judgment),
+                      'structured_output': judgment}))
+    sys.exit()
 if 'Ask first' in prompt:
     model = sys.argv[sys.argv.index('--model') + 1] if '--model' in sys.argv else 'default'
     print(json.dumps({'type': 'result', 'is_error': False, 'result': f'Which file should change? ({model})'}))
@@ -427,7 +442,7 @@ class Slice4Acceptance(unittest.TestCase):
         self.assertEqual(output.split("\n")[:6], ["no host env", "HTTP/1.1 403 Filtered", "HTTP/1.1 403 Filtered",
                                                   "direct blocked", "direct blocked", "dns blocked"])
 
-    def use_agent_wrappers(self):
+    def use_agent_wrappers(self, reviewer="reviewer_codex.py"):
         fakebin = self.repo / "fakebin"
         fakebin.mkdir()
         for name, program in (("claude", FAKE_CLAUDE), ("codex", FAKE_CODEX)):
@@ -439,7 +454,7 @@ class Slice4Acceptance(unittest.TestCase):
         path = {"PATH": "/workspace/fakebin:/usr/local/bin:/usr/bin:/bin"}
         self.worker.policy["coder"] = {"argv": ["teem-implement"], "env": path}
         self.worker.policy["reviewer"].update(
-            executable=str(Path(__file__).resolve().parent.parent / "teem" / "reviewer_codex.py"), env=path)
+            executable=str(Path(__file__).resolve().parent.parent / "teem" / reviewer), env=path)
 
     def test_agent_wrappers_revise_on_failed_checks_and_review(self):
         self.use_agent_wrappers()
@@ -467,6 +482,18 @@ class Slice4Acceptance(unittest.TestCase):
                    WHERE t.run_id=%s AND t.kind='code_and_check' ORDER BY t.revision_number""", (run_id,))]
             self.assertEqual(summaries, ["Set value.txt to wrong", "Set value.txt to after",
                                          "Set value.txt to after reviewed"])
+
+    def test_claude_reviewer_requests_changes_then_passes(self):
+        self.use_agent_wrappers(reviewer="reviewer_claude.py")
+        run_id = self.propose(revisions=2).split("/")[-1]
+        for _ in range(5):
+            self.claim_and_execute()
+        with connect(self.dsn) as conn:
+            self.assertEqual(self.run_status(run_id)["status"], "ready_to_merge")
+            verdicts = [r["result"]["verdict"] for r in conn.execute(
+                """SELECT v.result FROM reviews v JOIN attempts a ON a.id=v.attempt_id
+                   JOIN tasks t ON t.id=a.task_id WHERE t.run_id=%s ORDER BY v.created_at""", (run_id,))]
+        self.assertEqual(verdicts, ["changes_required", "pass"])
 
     def test_implementer_without_changes_asks_the_user(self):
         self.use_agent_wrappers()
