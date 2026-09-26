@@ -84,7 +84,7 @@ Follow [worker setup](deploy/worker/README.md) to build the agent and proxy imag
 To review with Claude instead of Codex, install `teem/reviewer_claude.py` as the reviewer executable, give the reviewer role `CLAUDE_CODE_OAUTH_TOKEN` in its `env`, and use `"destination": "anthropic"` (and a matching identity, such as `claude-reviewer`) in both `reviewer.json` and the worker policy. Each review is still a fresh session that never sees the implementer's conversation, but the same model family writing and reviewing catches fewer shared blind spots. Create the Claude token with `claude setup-token`. It uses your Claude subscription and shares its usage limits with your interactive use. Log Codex in once with `HOME=/srv/teem/codex-home codex login --device-auth`. The reviewer mounts that directory as its home so Codex can refresh its token. Each role's `env` and `home` reach only that role's containers. Set `TEEM_CLAUDE_MODEL` or `TEEM_CODEX_MODEL` in a role's `env` to choose each role's default model. A request can also ask for the implementer model for one Run, such as "use Opus for this"; the contract records `sonnet` or `opus`, the Approve message shows it, and it overrides the worker default for that Run.
 
 ```sh
-teem-worker --url https://teem.example --token "$TEEM_WORKER_TOKEN" --worker-id worker-1 --projects policy.json --state-dir /srv/teem/worker-state
+teem-worker --url https://teem.example --token-file /srv/teem/config/worker-token --worker-id worker-1 --projects policy.json --state-dir /srv/teem/worker-state
 ```
 
 ## How a Run works
@@ -103,6 +103,14 @@ Limits:
 - **Sizes:** candidate bundles up to 50 MiB, review diffs up to 512 KiB, and review contexts up to 1 MiB.
 
 A lost lease stays unresolved until worker reconciliation confirms the old container stopped.
+
+When a Run stops, the check-in says why:
+
+- **A failure** shows its last error, such as a provider's 401.
+- **A reviewer failure** offers **Retry review**, which reviews the same Candidate again without redoing the implementation. Each Run gets one retry, adding two review attempts.
+- **A Run stopped at review** (revision limit or an uncertain reviewer) shows the review summary and top findings, and offers **Publish anyway**. That opens the pull request titled "review not passed", with the open findings in its description. Both buttons are recorded as Approvals.
+
+If queued work waits 10 minutes while the worker has been silent for five, the bot says so once per Run.
 
 ## Tests
 

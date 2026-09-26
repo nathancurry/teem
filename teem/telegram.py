@@ -8,7 +8,8 @@ from . import decider, github
 from .common import IMPLEMENTER_MODELS, STATUS_LABELS, ApiError
 from .db import connect
 from .speech import MAX_AUDIO, MAX_SECONDS, SpeechError
-from .workflow import CANCELLABLE, cancel_run, create_run, decide_run, request_replacement
+from .workflow import (CANCELLABLE, cancel_run, create_run, decide_run, publish_anyway, request_replacement,
+                       retry_review)
 
 
 API = "https://api.telegram.org"
@@ -265,6 +266,12 @@ def apply_callback(conn, data):
                 decision = "approve" if parts[3] == "a" else "deny"
                 decide_run(conn, parts[1], parts[2], decision, "telegram_button")
                 return ["Approved. The run is queued." if decision == "approve" else "Denied."]
+            if parts[0] == "v" and len(parts) == 2:
+                retry_review(conn, parts[1], "telegram_button")
+                return ["Retrying the review of the same Candidate."]
+            if parts[0] == "u" and len(parts) == 2:
+                publish_anyway(conn, parts[1], "telegram_button")
+                return ["Publishing it as a pull request marked as not passing review."]
             if parts[0] == "p" and len(parts) == 3 and parts[2] in ("a", "d"):
                 project = conn.execute("SELECT * FROM projects WHERE grant_id=%s FOR UPDATE", (parts[1],)).fetchone()
                 if not project or project["status"] != "proposed":
@@ -350,6 +357,12 @@ def run_update(conn, run_id, origin):
         # The pull request is where the user reviews and merges; the Teem page holds the evidence.
         return text + f"\n{run['pr_url']}", None
     buttons = None
+    if run["status"] in ("failed", "uncertain", "blocked", "checks_failed"):
+        text += stop_details(conn, run_id, run)
+    if run["status"] == "failed" and last_failure_was_review(conn, run_id):
+        buttons = [[{"text": "Retry review", "callback_data": f"v:{run_id}"}]]
+    if run["status"] == "blocked" and run["stop_reason"] in ("revision_limit", "review_uncertain"):
+        buttons = [[{"text": "Publish anyway", "callback_data": f"u:{run_id}"}]]
     if run["status"] == "awaiting_approval":
         checks = ", ".join(check["name"] for check in contract["checks"]) or "none (.teem/checks.json not found)"
         text += (f"\nDone when: {contract['acceptance_criteria'][:600]}\nChecks: {checks}"
@@ -358,6 +371,49 @@ def run_update(conn, run_id, origin):
         prefix = f"r:{run_id}:{run['contract_version']}:"
         buttons = [[{"text": "Approve", "callback_data": prefix + "a"}, {"text": "Deny", "callback_data": prefix + "d"}]]
     return text + f"\n{origin}/runs/{run_id}", buttons
+
+
+def stop_details(conn, run_id, run):
+    """Why a Run stopped, in a few lines, so the user can decide without opening the Run page."""
+    if run["status"] == "checks_failed":
+        evidence = conn.execute("""SELECT x.evidence FROM runs r JOIN candidates x ON x.id=r.current_candidate_id
+                                   WHERE r.id=%s""", (run_id,)).fetchone()
+        failed = [c["name"] for c in (evidence["evidence"]["checks"] if evidence else []) if c["exit_code"] != 0]
+        return "\nFailed checks: " + (", ".join(failed) or "unknown")
+    if run["stop_reason"] in ("revision_limit", "review_uncertain"):
+        review = conn.execute("""SELECT v.result FROM reviews v JOIN attempts a ON a.id=v.attempt_id
+                                 JOIN tasks t ON t.id=a.task_id WHERE t.run_id=%s AND v.disposition='accepted'
+                                 ORDER BY v.created_at DESC LIMIT 1""", (run_id,)).fetchone()
+        if not review:
+            return ""
+        result = review["result"]
+        lines = [f"\nReview: {result['summary'][:300]}"]
+        lines += [f"- {finding['description'][:200]}" for finding in result["findings"][:3]]
+        lines += [f"- Unsure: {item[:200]}" for item in result["uncertainties"][:3]]
+        return "\n".join(lines)
+    error = last_error(conn, run_id)
+    return f"\nError: {error}" if error else ""
+
+
+def last_error(conn, run_id):
+    row = conn.execute("""SELECT a.usage->>'error' AS error,v.validation_error,v.raw_output
+                          FROM attempts a JOIN tasks t ON t.id=a.task_id
+                          LEFT JOIN reviews v ON v.attempt_id=a.id
+                          WHERE t.run_id=%s ORDER BY a.started_at DESC LIMIT 1""", (run_id,)).fetchone()
+    if not row:
+        return None
+    if row["validation_error"] and row["validation_error"].startswith("reviewer exited"):
+        # The reviewer's own last output line says why it failed (for example, a 401 from its provider).
+        lines = [line for line in (row["raw_output"] or "").splitlines() if line.strip()]
+        return (lines[-1] if lines else row["validation_error"])[:300]
+    return (row["error"] or row["validation_error"] or "")[:300] or None
+
+
+def last_failure_was_review(conn, run_id):
+    task = conn.execute("""SELECT kind,status FROM tasks WHERE run_id=%s ORDER BY revision_number DESC,kind DESC
+                           LIMIT 1""", (run_id,)).fetchone()
+    return bool(task and task["kind"] == "review" and task["status"] == "failed") and not conn.execute(
+        "SELECT 1 FROM approvals WHERE run_id=%s AND action='retry_review'", (run_id,)).fetchone()
 
 
 def project_prompt(conn, project_id):

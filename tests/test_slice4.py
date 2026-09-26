@@ -182,6 +182,7 @@ class Slice4Acceptance(unittest.TestCase):
     stop_server = slice1.SliceAcceptance.stop_server
     browser = slice1.SliceAcceptance.browser
     claim_and_execute = slice1.SliceAcceptance.claim_and_execute
+    reviewer_verdict = slice1.SliceAcceptance.reviewer_verdict
     propose = slice1.SliceAcceptance.propose
 
     def setUp(self):
@@ -648,6 +649,68 @@ class Slice4Acceptance(unittest.TestCase):
         self.assertTrue(resent["text"].startswith("Decision required: Test: Change value"))
         self.assertEqual(resent["reply_markup"]["inline_keyboard"][0][0]["callback_data"], f"r:{run['id']}:1:a")
 
+    def test_reviewer_failure_reports_its_error_and_retries_only_the_review(self):
+        self.reviewer.write_text("#!/usr/bin/python3\nimport sys\n"
+                                 "sys.stderr.write('codex failed: 401 Unauthorized\\n')\nsys.exit(1)\n")
+        self.reviewer.chmod(0o755)
+        run_id = self.propose().split("/")[-1]
+        coding = self.claim_and_execute()
+        self.claim_and_execute()
+        self.claim_and_execute()
+        self.drain()
+        failure = self.api.state["sent"][-1]
+        self.assertIn("Error: codex failed: 401 Unauthorized", failure["text"])
+        self.assertEqual(failure["reply_markup"]["inline_keyboard"][0][0]["callback_data"], f"v:{run_id}")
+        self.reviewer_verdict("pass")
+        self.deliver(callback(800, f"v:{run_id}"), callback(801, f"v:{run_id}"))
+        self.assertEqual(self.texts()[-2:], ["Retrying the review of the same Candidate.",
+                                             "That decision no longer applies (only a Run stopped by a failed "
+                                             "review can retry its review)."])
+        review = self.claim_and_execute()
+        self.assertEqual(review["kind"], "review")
+        self.assertEqual(self.run_status(run_id)["status"], "ready_to_merge")
+        with connect(self.dsn) as conn:
+            codings = conn.execute("""SELECT count(*) FROM attempts a JOIN tasks t ON t.id=a.task_id
+                                      WHERE t.run_id=%s AND t.kind='code_and_check'""", (run_id,)).fetchone()
+        self.assertEqual(codings["count"], 1, "the implementation was not redone")
+        self.assertIsNotNone(coding)
+
+    def test_revision_limit_stop_shows_findings_and_can_publish_anyway(self):
+        self.reviewer_verdict("changes_required")
+        run_id = self.propose(revisions=0).split("/")[-1]
+        self.claim_and_execute()
+        self.claim_and_execute()
+        self.drain()
+        stop = self.api.state["sent"][-1]
+        self.assertIn("Stop reason: revision_limit\nReview: Review completed\n- Outcome missing", stop["text"])
+        self.assertEqual(stop["reply_markup"]["inline_keyboard"][0][0]["callback_data"], f"u:{run_id}")
+        self.deliver(callback(900, f"u:{run_id}"))
+        self.assertEqual(self.texts()[-1], "Publishing it as a pull request marked as not passing review.")
+        self.assertTrue(github.publish_due(self.server.app))
+        pull = self.github_api.pulls[-1]
+        self.assertEqual(pull["title"], "Teem (review not passed): Change value")
+        self.assertIn("did not pass independent review", pull["body"])
+        self.assertIn("- Outcome missing", pull["body"])
+
+    def test_quiet_worker_alerts_once_per_waiting_run(self):
+        run_id = self.propose().split("/")[-1]
+        app = self.server.app
+
+        def alerts():
+            app.alert_idle_worker()
+            self.drain()
+            return [text for text in self.texts() if text.startswith("No worker has picked up this run")]
+
+        try:
+            self.assertEqual(alerts(), [], "a recently seen worker is not an outage")
+            with connect(self.dsn) as conn:
+                conn.execute("UPDATE runs SET updated_at=now()-interval '11 minutes' WHERE id=%s", (run_id,))
+            app.worker_seen -= 600
+            self.assertEqual(len(alerts()), 1)
+            self.assertEqual(len(alerts()), 1, "one alert per waiting Run")
+        finally:
+            # Leave nothing claimable for later tests sharing this database.
+            self.browser("POST", f"/runs/{run_id}/cancel", {})
 
 if __name__ == "__main__":
     unittest.main()

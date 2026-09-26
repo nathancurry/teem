@@ -110,10 +110,16 @@ def pull_request_body(app, run):
     checks = "\n".join(f"- {c['name']}: {'passed' if c['exit_code'] == 0 else 'failed'}"
                        for c in run["evidence"].get("checks", [])) or "- None configured (.teem/checks.json)"
     review = run["review"] or {}
+    unresolved = ""
+    if run["unreviewed"]:
+        items = [f"- {f['description']}" for f in review.get("findings", [])] + \
+                [f"- Unsure: {u}" for u in review.get("uncertainties", [])]
+        unresolved = ("\n\n**This pull request did not pass independent review.** The user chose to publish it "
+                      "anyway. Unresolved review findings:\n\n" + ("\n".join(items) or "- None recorded"))
     return (f"**Objective**\n\n{contract['objective']}\n\n**Acceptance criteria**\n\n{contract['acceptance_criteria']}"
             f"\n\n**Checks**\n\n{checks}\n\n**Implementer summary**\n\n{run['summary'] or 'None reported.'}"
             f"\n\n**Independent review**: {review.get('verdict', 'unknown')}. {review.get('summary', '')}"
-            f"\n\nTeem run: {app.origin}/runs/{run['id']}")
+            f"{unresolved}\n\nTeem run: {app.origin}/runs/{run['id']}")
 
 
 def open_pull_request(app, run):
@@ -139,7 +145,8 @@ def open_pull_request(app, run):
     existing = api(app, "GET", f"/repos/{repo}/pulls?{query}")
     if existing:
         return existing[0]["html_url"]
-    title = "Teem: " + run["body"]["objective"].splitlines()[0][:70]
+    title = ("Teem (review not passed): " if run["unreviewed"] else "Teem: ") + \
+        run["body"]["objective"].splitlines()[0][:70]
     try:
         return api(app, "POST", f"/repos/{repo}/pulls", {"title": title, "head": branch, "base": default,
                                                          "body": pull_request_body(app, run)})["html_url"]
@@ -156,7 +163,9 @@ def publish_due(app):
         run = conn.execute("""SELECT r.id,r.project_id,r.publish_attempts,c.body,x.head_commit,x.artifact_sha256,
                               x.evidence,a.path,p.status AS project_status,u.usage->>'summary' AS summary,
                               (SELECT source FROM approvals WHERE run_id=r.id AND decision='approve'
-                               ORDER BY created_at DESC LIMIT 1) AS approval_source,
+                               AND action='code_check_review' ORDER BY created_at DESC LIMIT 1) AS approval_source,
+                              EXISTS (SELECT 1 FROM approvals WHERE run_id=r.id AND action='publish_unreviewed')
+                               AS unreviewed,
                               (SELECT v.result FROM reviews v JOIN attempts ra ON ra.id=v.attempt_id
                                JOIN tasks t ON t.id=ra.task_id WHERE t.input_candidate_id=x.id
                                AND v.disposition='accepted' ORDER BY v.created_at DESC LIMIT 1) AS review

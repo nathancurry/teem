@@ -577,12 +577,17 @@ class Worker:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", required=True)
-    parser.add_argument("--token", required=True)
+    token = parser.add_mutually_exclusive_group(required=True)
+    token.add_argument("--token", help="worker bearer token; prefer --token-file to keep it out of process listings")
+    token.add_argument("--token-file", help="file whose first line is the worker bearer token")
     parser.add_argument("--worker-id", required=True)
     parser.add_argument("--projects", required=True,
                         help="worker-local policy JSON: allowed GitHub owners, coder, reviewer, optional read token")
     parser.add_argument("--state-dir", required=True)
-    Worker(parser.parse_args()).run()
+    args = parser.parse_args()
+    if args.token_file:
+        args.token = Path(args.token_file).read_text().strip()
+    Worker(args).run()
 
 
 if __name__ == "__main__":

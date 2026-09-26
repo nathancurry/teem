@@ -35,7 +35,7 @@ from .review import ReviewInputError, build_context, validate_result
 from .speech import SpeechRunner
 from . import decider, github, telegram
 from .workflow import (cancel_run, create_run, decide_run, reviewer_identity, run_cancelled, status_rows,
-                       stop_run)
+                       stop_run, task_attempt_limit)
 
 
 def lock_attempt_rows(conn, attempt_id):
@@ -174,6 +174,7 @@ def assignment(row):
 
 
 SESSION_SECONDS = 30 * 24 * 3600
+WORKER_QUIET_SECONDS = 300
 
 
 def page(title, content, script=True):
@@ -237,6 +238,7 @@ class Handler(BaseHTTPRequestHandler):
             expected = "Bearer " + self.app.worker_token
             if not hmac.compare_digest(value, expected):
                 fail(401, "worker authentication required")
+            self.app.worker_seen = time.monotonic()
             version = self.headers.get("X-Teem-Protocol")
             if version != str(PROTOCOL):
                 fail(426, "incompatible worker protocol")
@@ -665,7 +667,7 @@ class Handler(BaseHTTPRequestHandler):
                     conn.commit()
                     self.respond(200, {"assignment": None})
                     return
-                if task["generation"] >= 2:
+                if task["generation"] >= task_attempt_limit(conn, task):
                     conn.execute("UPDATE tasks SET status='failed' WHERE id=%s", (task["id"],))
                     stop_run(conn, task["run_id"], "attempt_limit")
                     conn.commit()
@@ -1009,7 +1011,8 @@ class Handler(BaseHTTPRequestHandler):
                 attempt_status = ("reconciled_uncertain" if outcome == "uncertain" else
                                   "failed" if outcome == "review" and error else outcome)
                 if status == "failed" and outcome != "candidate":
-                    if row["generation"] < 2 and attempt_count(conn, row["run_id"]) < row["body"]["limits"]["attempts"]:
+                    if row["generation"] < task_attempt_limit(conn, row) and \
+                            attempt_count(conn, row["run_id"]) < row["body"]["limits"]["attempts"]:
                         status = "awaiting_review" if row["kind"] == "review" else "queued"
                     elif attempt_count(conn, row["run_id"]) >= row["body"]["limits"]["attempts"]:
                         status = "blocked"
@@ -1211,6 +1214,8 @@ class App:
         self.worker_token = args.worker_token
         self.origin = args.origin
         self.stopping = threading.Event()
+        # Treat startup as contact, so a restart doesn't alert before the worker has had a chance to poll.
+        self.worker_seen = time.monotonic()
         speech_config = getattr(args, "speech_config", None)
         speech_scratch = getattr(args, "speech_scratch", None)
         if bool(speech_config) != bool(speech_scratch):
@@ -1248,9 +1253,30 @@ class App:
                 with connect(self.dsn) as conn:
                     expire_leases(conn)
                 prepare_reviews(self)
+                self.alert_idle_worker()
             except (psycopg.Error, OSError, ReviewInputError):
                 pass
             self.stopping.wait(2)
+
+    def alert_idle_worker(self):
+        """Tell the user once per Run when queued work is waiting and the worker has gone quiet.
+
+        An idle worker polls every few seconds and a busy one renews its lease every ten, so five
+        quiet minutes means it is down or unreachable, not merely busy with another Run.
+        """
+        if time.monotonic() - self.worker_seen < WORKER_QUIET_SECONDS:
+            return
+        with connect(self.dsn) as conn:
+            waiting = conn.execute("""SELECT r.id,c.body->>'objective' AS objective FROM runs r
+                                      JOIN contracts c ON c.run_id=r.id AND c.version=r.contract_version
+                                      WHERE r.status IN ('queued','awaiting_review')
+                                      AND r.updated_at < now()-interval '10 minutes'
+                                      AND NOT EXISTS (SELECT 1 FROM events e WHERE e.run_id=r.id
+                                                      AND e.kind='worker_offline_alert')""").fetchall()
+            for run in waiting:
+                event(conn, run["id"], "worker_offline_alert", {})
+                telegram.queue_message(conn, f"No worker has picked up this run in 10 minutes: {run['objective'][:200]}\n"
+                                             "Check that teem-worker is running and can reach the server.", run["id"])
 
     def stop(self):
         self.stopping.set()

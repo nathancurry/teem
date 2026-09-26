@@ -141,6 +141,68 @@ def run_cancelled(conn, run_id, reviewer):
     return new_run
 
 
+def task_attempt_limit(conn, task):
+    """Two Attempts per Task. A review Task the user chose to retry gets two more."""
+    if task["kind"] == "review" and conn.execute("""SELECT 1 FROM approvals WHERE run_id=%s
+                                                    AND action='retry_review' AND decision='approve'""",
+                                                 (task["run_id"],)).fetchone():
+        return 4
+    return 2
+
+
+def record_decision(conn, run, action, source):
+    # approvals is unique per (Run, contract version, action), so each of these decisions happens once.
+    conn.execute("""INSERT INTO approvals(id,run_id,contract_version,action,decision,source,target,target_state)
+                    VALUES (%s,%s,%s,%s,'approve',%s,%s,%s)""",
+                 (new_id(), run["id"], run["contract_version"], action, source, run["project_id"], run["status"]))
+
+
+def retry_review(conn, run_id, source):
+    """After the reviewer failed (for example, bad credentials), review the same Candidate again
+    instead of redoing the implementation."""
+    run = conn.execute("SELECT * FROM runs WHERE id=%s FOR UPDATE", (run_id,)).fetchone()
+    if not run:
+        fail(404, "run not found")
+    task = conn.execute("""SELECT * FROM tasks WHERE run_id=%s ORDER BY revision_number DESC,kind DESC
+                           LIMIT 1 FOR UPDATE""", (run_id,)).fetchone()
+    if run["status"] != "failed" or not task or task["kind"] != "review" or task["status"] != "failed":
+        fail(409, "only a Run stopped by a failed review can retry its review")
+    if conn.execute("""SELECT 1 FROM attempts WHERE task_id=%s AND status IN ('running','uncertain')""",
+                    (task["id"],)).fetchone():
+        fail(409, "worker reconciliation required before retry")
+    used = conn.execute("""SELECT count(*) AS n FROM attempts a JOIN tasks t ON t.id=a.task_id
+                           WHERE t.run_id=%s""", (run_id,)).fetchone()["n"]
+    body = conn.execute("SELECT body FROM contracts WHERE run_id=%s AND version=%s",
+                        (run_id, run["contract_version"])).fetchone()["body"]
+    if used >= body["limits"]["attempts"]:
+        fail(409, "the Run's attempt limit is reached")
+    if conn.execute("SELECT 1 FROM approvals WHERE run_id=%s AND action='retry_review'", (run_id,)).fetchone():
+        fail(409, "this review was already retried once")
+    record_decision(conn, run, "retry_review", source)
+    conn.execute("UPDATE tasks SET status='queued',cancel_requested=false WHERE id=%s", (task["id"],))
+    # An explicit retry may come hours later; give it an hour without ever shortening the deadline.
+    conn.execute("""UPDATE runs SET status='awaiting_review',stop_reason=NULL,updated_at=now(),
+                    deadline=GREATEST(deadline,now()+interval '1 hour') WHERE id=%s""", (run_id,))
+    event(conn, run_id, "review_retry_queued", {"source": source})
+
+
+def publish_anyway(conn, run_id, source):
+    """Publish a Candidate whose checks pass but whose review never passed, as the user decided."""
+    run = conn.execute("SELECT * FROM runs WHERE id=%s FOR UPDATE", (run_id,)).fetchone()
+    if not run:
+        fail(404, "run not found")
+    if run["status"] != "blocked" or run["stop_reason"] not in ("revision_limit", "review_uncertain") or \
+       not run["current_candidate_id"]:
+        fail(409, "only a Run stopped at review can be published anyway")
+    evidence = conn.execute("SELECT evidence FROM candidates WHERE id=%s", (run["current_candidate_id"],)).fetchone()
+    if any(check["exit_code"] != 0 for check in evidence["evidence"].get("checks", [])):
+        fail(409, "the Candidate's checks did not pass")
+    record_decision(conn, run, "publish_unreviewed", source)
+    conn.execute("""UPDATE runs SET status='ready_to_merge',stop_reason=NULL,next_publish_at=NULL,
+                    updated_at=now() WHERE id=%s""", (run_id,))
+    event(conn, run_id, "publish_unreviewed_approved", {"source": source})
+
+
 def status_rows(conn, run_id=None):
     rows = conn.execute("""SELECT r.id,r.project_id,p.name AS project_name,r.status,r.stop_reason,r.pr_url,
                           r.updated_at,c.body,r.current_candidate_id,
