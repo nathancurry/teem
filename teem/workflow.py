@@ -92,11 +92,16 @@ def stop_run(conn, run_id, reason, kind="blocked"):
           notify=prior != kind and kind in ("blocked", "failed", "checks_failed", "uncertain"))
 
 
-def cancel_run(conn, run_id):
+CANCELLABLE = ("queued", "coding", "awaiting_review", "reviewing", "uncertain")
+
+
+def cancel_run(conn, run_id, reviewer):
+    """Request cancellation. A Run with no execution in flight is cancelled at once; otherwise it
+    waits in `cancelling` until the worker confirms the stop. Returns the Run's new status."""
     run = conn.execute("SELECT * FROM runs WHERE id=%s FOR UPDATE", (run_id,)).fetchone()
     if not run:
         fail(404, "run not found")
-    if run["status"] not in ("queued", "coding", "awaiting_review", "reviewing", "uncertain"):
+    if run["status"] not in CANCELLABLE:
         fail(409, "run cannot be cancelled")
     pending = run["status"] in ("coding", "reviewing", "uncertain")
     status = "cancelling" if pending else "cancelled"
@@ -104,7 +109,36 @@ def cancel_run(conn, run_id):
     conn.execute("""UPDATE tasks SET cancel_requested=true,status=%s WHERE run_id=%s
                     AND status IN ('queued','running','uncertain')""", (status, run_id))
     event(conn, run_id, "cancel_requested", {})
-    return run
+    if status == "cancelled":
+        run_cancelled(conn, run_id, reviewer)
+    return status
+
+
+def request_replacement(conn, run_id, proposal, reviewer):
+    """Stop a Run and start `proposal` in its place once the stop is confirmed.
+
+    The proposal is kept in the event log, so a replacement survives restarts while the old Run
+    finishes cancelling. Returns the old Run's status after the request.
+    """
+    event(conn, run_id, "replacement_requested", proposal)
+    return cancel_run(conn, run_id, reviewer)
+
+
+def run_cancelled(conn, run_id, reviewer):
+    """Called in the transaction that makes a Run `cancelled`: confirm it and start any replacement."""
+    event(conn, run_id, "cancel_confirmed", {}, notify=True)
+    pending = conn.execute("""SELECT payload FROM events WHERE run_id=%s AND kind='replacement_requested'
+                              ORDER BY id DESC LIMIT 1""", (run_id,)).fetchone()
+    if not pending:
+        return None
+    proposal = pending["payload"]
+    new_run, created = create_run(conn, proposal["project_id"], proposal["base"], proposal["checks"], reviewer,
+                                  proposal["objective"], proposal["criteria"], "replace:" + str(run_id),
+                                  proposal["revisions"], proposal.get("model"))
+    if created and conn.execute("SELECT status FROM runs WHERE id=%s", (new_run,)).fetchone()["status"] == "queued":
+        # A granted replacement starts without a decision message, so say that it started.
+        event(conn, new_run, "replacement_started", {"replaces": str(run_id)}, notify=True)
+    return new_run
 
 
 def status_rows(conn, run_id=None):

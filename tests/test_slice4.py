@@ -409,9 +409,9 @@ class Slice4Acceptance(unittest.TestCase):
         self.model.responses = [("", ("cancel_run", {"run_id": str(run["id"])})), ("Queued for approval.", run_tool)]
         self.deliver(message(404, text=f"/revoke {self.project_id}"), message(405, text="stop that run"),
                      callback(406, f"p:{grant}:a"), message(407, text="change the value again"))
-        self.assertEqual(self.texts()[-5:-1], [f"Revoked. Teem will ask before each run on {self.project_id}.",
-                                               "Cancellation requested.", "That request no longer applies.",
-                                               "Queued for approval."])
+        self.assertEqual(self.texts()[-5], f"Revoked. Teem will ask before each run on {self.project_id}.")
+        self.assertTrue(self.texts()[-4].startswith("Cancelled: Test: Change value"))
+        self.assertEqual(self.texts()[-3:-1], ["That request no longer applies.", "Queued for approval."])
         self.assertTrue(self.texts()[-1].startswith("Decision required:"))
         self.assertEqual(self.run_row()["status"], "awaiting_approval")
 
@@ -604,6 +604,49 @@ class Slice4Acceptance(unittest.TestCase):
         expires, signature = cookie["Cookie"].split("=", 1)[1].split(".")
         forged = {"Cookie": f"teem_session={int(expires) + 1}.{signature}"}
         self.assertEqual(self.request("GET", run_path, headers=forged)[0], 303)
+
+    def test_replacing_a_running_run_waits_for_the_stop_and_confirms(self):
+        self.enable_decider()
+        with connect(self.dsn) as conn:
+            conn.execute("UPDATE projects SET status='granted' WHERE id=%s", (self.project_id,))
+        first = {"repo": self.project_id, "objective": "Change value", "acceptance_criteria": "value.txt contains after"}
+        self.model.responses = [("Starting.", ("propose_run", first))]
+        self.deliver(message(600, text="change the value"))
+        old = self.run_row()
+        attempt = self.worker.api.call("POST", "/worker/claim", {"worker_id": "worker",
+            "capabilities": ["code", "check", "bundle", "review"]})["assignment"]
+        self.model.responses = [("Rerunning with Opus.", ("propose_run", {**first, "model": "opus",
+                                                                          "replaces_run_id": str(old["id"])}))]
+        self.deliver(message(601, text="cancel that and rerun it on opus"))
+        self.assertEqual(self.texts()[-2:], ["Rerunning with Opus.",
+                                             "Stopping the current run. The new one starts as soon as it has stopped."])
+        self.assertEqual(self.run_row()["id"], old["id"], "the replacement waits until the old run has stopped")
+        self.worker.api.call("POST", "/worker/report/" + attempt["attempt_id"],
+                             {"generation": attempt["generation"], "outcome": "cancelled"})
+        self.drain()
+        new = self.run_row()
+        self.assertNotEqual(new["id"], old["id"])
+        self.assertEqual(self.run_status(old["id"])["status"], "cancelled")
+        self.assertEqual(new["status"], "queued")
+        with connect(self.dsn) as conn:
+            self.assertEqual(conn.execute("SELECT body FROM contracts WHERE run_id=%s", (new["id"],)).fetchone()
+                             ["body"]["implementer_model"], "opus")
+        self.assertTrue(self.texts()[-2].startswith("Cancelled: Test: Change value"))
+        self.assertTrue(self.texts()[-1].startswith("Queued: Test: Change value"))
+        # Leave nothing claimable for later tests sharing this database.
+        self.assertEqual(self.browser("POST", f"/runs/{new['id']}/cancel", {})[0], 303)
+
+    def test_show_run_resends_pending_decision_buttons(self):
+        self.enable_decider()
+        proposal = {"repo": self.project_id, "objective": "Change value", "acceptance_criteria": "value.txt contains after"}
+        self.model.responses = [("", ("propose_run", proposal))]
+        self.deliver(message(700, text="change the value"))
+        run = self.run_row()
+        self.model.responses = [("Here it is again.", ("show_run", {"run_id": str(run["id"])}))]
+        self.deliver(message(701, text="there's no approve button"))
+        resent = self.api.state["sent"][-1]
+        self.assertTrue(resent["text"].startswith("Decision required: Test: Change value"))
+        self.assertEqual(resent["reply_markup"]["inline_keyboard"][0][0]["callback_data"], f"r:{run['id']}:1:a")
 
 
 if __name__ == "__main__":

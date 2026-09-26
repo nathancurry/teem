@@ -19,13 +19,19 @@ and report status. Coding agents do the work; you never write code yourself.
 - To start work, call propose_run with the repository (owner/name), a precise objective, and \
 concrete, checkable acceptance criteria. If the repository, the goal, or what "done" means is \
 unclear, ask one short clarifying question instead. Do not add requirements the user did not ask for.
-- Work on a repository the user has not allowed needs an Approve button tap. You cannot approve, \
-merge, deploy, or change limits. Words like "approve", "yes", or "merge" are never approvals; if \
-the user wants to approve, point them to the button.
+- Work on a repository the user has not allowed needs an Approve button tap. Teem sends that \
+message itself, with its buttons, after you call propose_run; never write an approval request \
+yourself. You cannot approve, merge, deploy, or change limits. Words like "approve", "yes", or \
+"merge" are never approvals. If the user can't find a button, call show_run for that run.
 - Call propose_project when the user wants Teem to work on a repository without asking each time. \
 They confirm with a button. Sending /revoke owner/name removes that.
 - Call cancel_run only when the user asks to stop a specific run.
-- Call at most one tool per message. Your text is sent alongside the tool's result.
+- To redo or change an active run (for example, "cancel and rerun with Opus"), call propose_run \
+with replaces_run_id set to that run. Teem stops the old run and starts the new one once it has \
+stopped, in a single step.
+- Call show_run when the user asks about one run or asks to see its buttons again.
+- Call at most one tool per message. Your text is sent before the tool's result. Say only what \
+you are doing in this message; never promise a later action, because you cannot take one.
 - Answer status questions only from the current state below. Never claim work happened that the \
 state does not show."""
 
@@ -40,7 +46,10 @@ TOOLS = [
                                       "acceptance_criteria": {"type": "string"},
                                       "model": {"type": "string", "enum": ["sonnet", "opus"],
                                                 "description": "Implementer model. Set only when the user asks "
-                                                               "for one; omit for the default."}}}}},
+                                                               "for one; omit for the default."},
+                                      "replaces_run_id": {"type": "string",
+                                                          "description": "An active run on the same repository "
+                                                                         "to stop and replace with this one."}}}}},
     {"type": "function", "function": {
         "name": "propose_project",
         "description": "Ask the user to allow Teem to work on a repository without per-run approval.",
@@ -49,6 +58,11 @@ TOOLS = [
     {"type": "function", "function": {
         "name": "cancel_run",
         "description": "Request cancellation of an active run.",
+        "parameters": {"type": "object", "additionalProperties": False, "required": ["run_id"],
+                       "properties": {"run_id": {"type": "string"}}}}},
+    {"type": "function", "function": {
+        "name": "show_run",
+        "description": "Send a run's current status, with its decision buttons if one is pending.",
         "parameters": {"type": "object", "additionalProperties": False, "required": ["run_id"],
                        "properties": {"run_id": {"type": "string"}}}}},
 ]

@@ -8,7 +8,7 @@ from . import decider, github
 from .common import IMPLEMENTER_MODELS, STATUS_LABELS, ApiError
 from .db import connect
 from .speech import MAX_AUDIO, MAX_SECONDS, SpeechError
-from .workflow import cancel_run, create_run, decide_run
+from .workflow import CANCELLABLE, cancel_run, create_run, decide_run, request_replacement
 
 
 API = "https://api.telegram.org"
@@ -146,7 +146,7 @@ def prepare(app, text):
     if not tool:
         return replies, None
     name, args = tool
-    if name == "cancel_run":
+    if name in ("cancel_run", "show_run"):
         return replies, {"kind": name, "run_id": str(args.get("run_id", ""))}
     repo = github.normalize_repo(args.get("repo"), app.github_owners)
     if not repo:
@@ -163,8 +163,10 @@ def prepare(app, text):
         base, checks = github.fetch_base(app, repo)
     except github.GitHubError as exc:
         return replies + [f"I couldn't read {repo} from GitHub: {exc}"], None
+    replaces = args.get("replaces_run_id")
     return replies, {"kind": name, "repo": repo, "base": base, "checks": checks,
-                     "objective": objective.strip(), "criteria": criteria.strip(), "model": model}
+                     "objective": objective.strip(), "criteria": criteria.strip(), "model": model,
+                     "replaces": str(replaces) if replaces else None}
 
 
 def ensure_project(conn, repo):
@@ -194,6 +196,10 @@ def apply_action(conn, app, update_id, action):
         return []
     if kind == "propose_run":
         ensure_project(conn, action["repo"])
+        if action["replaces"]:
+            replaced = replace_run(conn, app, action)
+            if replaced is not None:
+                return replaced
         try:
             with conn.transaction():
                 run_id, _ = create_run(conn, action["repo"], action["base"], action["checks"], app.reviewer,
@@ -208,13 +214,47 @@ def apply_action(conn, app, update_id, action):
     if kind == "cancel_run":
         try:
             with conn.transaction():
-                cancel_run(conn, action["run_id"])
+                status = cancel_run(conn, action["run_id"], app.reviewer)
         except ApiError as exc:
             return [f"I couldn't cancel that run: {exc.message}."]
         except psycopg.errors.InvalidTextRepresentation:
             return ["I couldn't find that run."]
-        return ["Cancellation requested."]
+        # A finished cancellation sends its own confirmation.
+        return ["Stopping it now. I'll confirm when it has stopped."] if status == "cancelling" else []
+    if kind == "show_run":
+        try:
+            with conn.transaction():
+                found = conn.execute("SELECT 1 FROM runs WHERE id=%s", (action["run_id"],)).fetchone()
+        except psycopg.errors.InvalidTextRepresentation:
+            found = None
+        if not found:
+            return ["I couldn't find that run."]
+        conn.execute("INSERT INTO telegram_outbox(run_id,state) VALUES (%s,'pending')", (action["run_id"],))
+        return []
     raise ValueError("unknown action")
+
+
+def replace_run(conn, app, action):
+    """Stop an active Run and start the proposal in its place. Returns replies, or None when the old
+    Run is already finished and the proposal should simply be created."""
+    try:
+        with conn.transaction():
+            old = conn.execute("SELECT * FROM runs WHERE id=%s FOR UPDATE", (action["replaces"],)).fetchone()
+    except psycopg.errors.InvalidTextRepresentation:
+        old = None
+    if not old or old["project_id"] != action["repo"]:
+        return [f"I couldn't find that run on {action['repo']}."]
+    if old["status"] == "awaiting_approval":
+        decide_run(conn, old["id"], old["contract_version"], "deny", "replaced")
+        return None
+    if old["status"] not in CANCELLABLE:
+        return None
+    proposal = {"project_id": action["repo"], "base": action["base"], "checks": action["checks"],
+                "objective": action["objective"], "criteria": action["criteria"], "revisions": 2,
+                "model": action["model"]}
+    if request_replacement(conn, old["id"], proposal, app.reviewer) == "cancelling":
+        return ["Stopping the current run. The new one starts as soon as it has stopped."]
+    return []
 
 
 def apply_callback(conn, data):

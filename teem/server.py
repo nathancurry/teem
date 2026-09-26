@@ -34,7 +34,8 @@ from .db import connect, event, initialize
 from .review import ReviewInputError, build_context, validate_result
 from .speech import SpeechRunner
 from . import decider, github, telegram
-from .workflow import cancel_run, create_run, decide_run, reviewer_identity, status_rows, stop_run
+from .workflow import (cancel_run, create_run, decide_run, reviewer_identity, run_cancelled, status_rows,
+                       stop_run)
 
 
 def lock_attempt_rows(conn, attempt_id):
@@ -570,7 +571,7 @@ class Handler(BaseHTTPRequestHandler):
                     conn.commit()
                     return self.redirect("/runs/" + run_id)
                 if action == "cancel":
-                    cancel_run(conn, run_id)
+                    cancel_run(conn, run_id, self.app.reviewer)
                     conn.commit()
                     return self.redirect("/runs/" + run_id)
                 run = conn.execute("SELECT * FROM runs WHERE id=%s FOR UPDATE", (run_id,)).fetchone()
@@ -810,6 +811,8 @@ class Handler(BaseHTTPRequestHandler):
                     conn.execute("UPDATE runs SET status=%s,updated_at=now() WHERE id=%s", (status, row["run_id"]))
                 event(conn, row["run_id"], "attempt_reconciled", {"attempt_id": attempt_id, "journal_state": state, "status": status},
                       notify=status in ("blocked", "uncertain") and row["run_status"] != status)
+                if status == "cancelled":
+                    run_cancelled(conn, row["run_id"], self.app.reviewer)
                 conn.commit()
                 self.respond(200, {"status": attempt_status, "cancel": row["cancel_requested"]})
                 return
@@ -931,6 +934,7 @@ class Handler(BaseHTTPRequestHandler):
                     conn.execute("UPDATE tasks SET status='cancelled' WHERE id=%s", (row["task_id"],))
                     conn.execute("UPDATE runs SET status='cancelled',updated_at=now() WHERE id=%s", (row["run_id"],))
                     event(conn, row["run_id"], "late_evidence_preserved", {"attempt_id": attempt_id, "outcome": outcome})
+                    run_cancelled(conn, row["run_id"], self.app.reviewer)
                     conn.commit()
                     self.respond(200, {"status": "cancelled"})
                     return
@@ -1020,6 +1024,8 @@ class Handler(BaseHTTPRequestHandler):
                 event(conn, row["run_id"], "attempt_reported", {"attempt_id": attempt_id, "outcome": outcome, "run_status": status},
                       notify=status in ("blocked", "failed", "checks_failed", "uncertain")
                       and row["run_status"] != status)
+                if status == "cancelled":
+                    run_cancelled(conn, row["run_id"], self.app.reviewer)
                 conn.commit()
                 self.respond(200, {"status": status})
                 return
