@@ -33,7 +33,7 @@ from .common import (
 from .db import connect, event, initialize
 from .review import ReviewInputError, build_context, validate_result
 from .speech import SpeechRunner
-from . import decider, github, telegram
+from . import decider, github, stats, telegram
 from .workflow import (cancel_run, create_run, decide_run, reviewer_identity, run_cancelled, status_rows,
                        stop_run, task_attempt_limit)
 
@@ -187,8 +187,9 @@ def page(title, content, script=True):
             "<style>body{font:16px system-ui;max-width:52rem;margin:2rem auto;padding:0 1rem;line-height:1.5}"
             "input,textarea,select,button{font:inherit;padding:.45rem}textarea{width:100%;box-sizing:border-box}"
             "label{display:block;margin:.8rem 0}pre{white-space:pre-wrap;background:#eee;padding:1rem}"
-            "li{margin:.5rem 0}a{color:#064c9e}</style>"
-            "<header><a href='/'>Teem</a></header>" + content +
+            "li{margin:.5rem 0}a{color:#064c9e}table{border-collapse:collapse;margin:.5rem 0}"
+            "td,th{border-bottom:1px solid #ddd;padding:.3rem .6rem;text-align:left;vertical-align:top}</style>"
+            "<header><a href='/'>Teem</a> · <a href='/stats'>Stats</a></header>" + content +
             ("<script src='/phone.js' defer></script>" if script else "") + "</html>").encode()
 
 
@@ -423,6 +424,11 @@ class Handler(BaseHTTPRequestHandler):
         with connect(self.app.dsn) as conn:
             expire_leases(conn)
             conn.commit()
+            if path == "/stats":
+                content = stats.render(stats.collect(conn))
+                conn.commit()
+                self.respond(200, page("Teem stats", content), "text/html; charset=utf-8")
+                return
             if path == "/":
                 projects = conn.execute("SELECT id,name FROM projects ORDER BY name").fetchall()
                 runs = status_rows(conn)

@@ -432,7 +432,7 @@ class Worker:
                                    "check_hash": contract["check_hash"], "sandbox": "bubblewrap-0.11",
                                    "checks": results}, "bundle": str(bundle),
                       "usage": {"coder_seconds_limit": CODER_SECONDS, "check_seconds_limit": CHECK_SECONDS,
-                                "summary": summary}}
+                                "summary": summary, "model": coder.get("env", {}).get("TEEM_CLAUDE_MODEL", "default")}}
             self.journal.update(attempt_id, "ready_to_report", result=result)
         except LeaseLost:
             self.report_outcome(assignment, "uncertain")
@@ -493,8 +493,10 @@ class Worker:
                                   mounts, "/workspace", timeout, reviewer),
                 attempt_id, timeout, lambda: self.heartbeat(assignment), self.journal)
             provenance["ended_at"] = datetime.now(timezone.utc).isoformat()
+            env = reviewer.get("env", {})
             result = {"outcome": "review", "generation": assignment["generation"],
-                      "raw_output": output, "provenance": provenance}
+                      "raw_output": output, "provenance": provenance,
+                      "usage": {"model": env.get("TEEM_CODEX_MODEL") or env.get("TEEM_CLAUDE_MODEL") or "default"}}
             if code:
                 result["validation_error"] = "reviewer exited " + str(code)
             elif len(output.encode()) >= MAX_OUTPUT_BYTES:

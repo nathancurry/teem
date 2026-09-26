@@ -12,7 +12,8 @@ def reviewer_identity(config):
             "destination": config["destination"], "timeout": config["timeout"]}
 
 
-def create_run(conn, project_id, base, checks, reviewer, objective, criteria, dedupe_key, revisions=2, model=None):
+def create_run(conn, project_id, base, checks, reviewer, objective, criteria, dedupe_key, revisions=2, model=None,
+               decider_model=None):
     """Create a proposed Run, or return the Run already created for this deduplication key.
 
     A granted project authorizes the Run in the same transaction; otherwise the Run waits for a
@@ -57,7 +58,8 @@ def create_run(conn, project_id, base, checks, reviewer, objective, criteria, de
     conn.execute("INSERT INTO contracts(run_id,version,body,proposal) VALUES (%s,1,%s::jsonb,%s::jsonb)",
                  (run_id, canonical(body), canonical(proposal)))
     granted = project["status"] == "granted"
-    event(conn, run_id, "proposal_created", {"contract_version": 1, "request_id": request_id}, notify=not granted)
+    event(conn, run_id, "proposal_created", {"contract_version": 1, "request_id": request_id,
+                                             "decider_model": decider_model}, notify=not granted)
     if granted:
         decide_run(conn, run_id, 1, "approve", "project_grant:" + str(project["grant_id"]))
     return run_id, True

@@ -15,7 +15,7 @@ Work starts only after you tap **Approve** on a proposal, or under a standing pr
 
 Requirements: Python 3.11+, PostgreSQL, Git, and HTTPS termination in front of the loopback server. Voice notes also need FFmpeg/ffprobe, Bubblewrap, and a static `whisper-cli` from [whisper.cpp v1.9.4](https://github.com/ggml-org/whisper.cpp/releases/tag/v1.9.4). See [TrueNAS deployment](deploy/truenas/README.md) for a complete example.
 
-Install with `uv sync` or `pip install .`. Initialize a fresh database with `teem-server init --dsn "$TEEM_DSN"`. Initialization is not a migration tool: apply [slice-3.sql](docs/architecture/slice-3.sql) to a slice-2 database and [slice-4.sql](docs/architecture/slice-4.sql) to a slice-3 database, each exactly once.
+Install with `uv sync` or `pip install .`. Initialize a fresh database with `teem-server init --dsn "$TEEM_DSN"`. Initialization is not a migration tool: apply [slice-3.sql](docs/architecture/slice-3.sql) to a slice-2 database, [slice-4.sql](docs/architecture/slice-4.sql) to a slice-3 database, and [v0.0.8.sql](docs/architecture/v0.0.8.sql) to a v0.0.7 database, each exactly once.
 
 The server reads these configuration files:
 
@@ -111,6 +111,8 @@ When a Run stops, the check-in says why:
 - **A Run stopped at review** (revision limit or an uncertain reviewer) shows the review summary and top findings, and offers **Publish anyway**. That opens the pull request titled "review not passed", with the open findings in its description. Both buttons are recorded as Approvals.
 
 If queued work waits 10 minutes while the worker has been silent for five, the bot says so once per Run.
+
+The **Stats** page (`/stats`) covers the last 30 days: outcomes, how often the first review passed, revisions per Run, how many of Teem's pull requests you merged, and why Runs stopped, broken down by implementer and decider model. The publisher checks open Teem PRs every 10 minutes to record whether they were merged or closed. Workers record the implementer and reviewer model per attempt from the Run's choice or the role's `TEEM_CLAUDE_MODEL`/`TEEM_CODEX_MODEL`; set these explicitly so the page doesn't show "default".
 
 ## Tests
 

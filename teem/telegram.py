@@ -205,7 +205,7 @@ def apply_action(conn, app, update_id, action):
             with conn.transaction():
                 run_id, _ = create_run(conn, action["repo"], action["base"], action["checks"], app.reviewer,
                                        action["objective"], action["criteria"], f"tg:{update_id}",
-                                       model=action["model"])
+                                       model=action["model"], decider_model=app.decider["model"])
         except psycopg.errors.UniqueViolation:
             return [f"A run is already active on {action['repo']}."]
         except ApiError as exc:

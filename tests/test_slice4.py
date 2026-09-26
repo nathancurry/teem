@@ -145,7 +145,7 @@ class FakeModel(BaseHTTPRequestHandler):
 class FakeGitHub(BaseHTTPRequestHandler):
     def do_GET(self):
         head = self.path.split("head=", 1)[1].split("&", 1)[0].replace("%3A", ":").replace("%2F", "/")
-        self.reply(200, [pr for pr in self.server.pulls if pr["head"] == head])
+        self.reply(200, [{**pr, "state": pr.get("state", "open")} for pr in self.server.pulls if pr["head"] == head])
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
@@ -711,6 +711,30 @@ class Slice4Acceptance(unittest.TestCase):
         finally:
             # Leave nothing claimable for later tests sharing this database.
             self.browser("POST", f"/runs/{run_id}/cancel", {})
+    def test_merged_pull_requests_and_models_reach_the_stats_page(self):
+        self.worker.policy["coder"]["env"] = {"TEEM_CLAUDE_MODEL": "sonnet"}
+        run_id = self.propose().split("/")[-1]
+        self.claim_and_execute()
+        self.claim_and_execute()
+        self.assertTrue(github.publish_due(self.server.app))
+        github.check_pull_requests(self.server.app)
+        self.assertEqual(self.run_status(run_id)["status"], "pr_open")
+        with connect(self.dsn) as conn:
+            self.assertEqual(conn.execute("SELECT pr_state FROM runs WHERE id=%s", (run_id,)).fetchone()["pr_state"], "open")
+            # Checks are rate-limited; make this one due again after the user merges on GitHub.
+            conn.execute("UPDATE runs SET pr_checked_at=now()-interval '11 minutes' WHERE id=%s", (run_id,))
+        self.github_api.pulls[-1].update(state="closed", merged_at="2026-09-26T12:00:00Z")
+        github.check_pull_requests(self.server.app)
+        with connect(self.dsn) as conn:
+            row = conn.execute("SELECT pr_state,pr_closed_at FROM runs WHERE id=%s", (run_id,)).fetchone()
+        self.assertEqual(row["pr_state"], "merged")
+        self.assertIsNotNone(row["pr_closed_at"])
+        status, _, body = self.browser("GET", "/stats")
+        self.assertEqual(status, 200)
+        page = body.decode()
+        self.assertIn("<td>sonnet</td>", page)
+        self.assertIn("pull requests merged:", page)
+
 
 if __name__ == "__main__":
     unittest.main()

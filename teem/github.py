@@ -199,11 +199,34 @@ def publish_due(app):
     return True
 
 
+def check_pull_requests(app):
+    """Record whether each open Teem pull request was merged or closed; the user's verdict on a Run."""
+    with connect(app.dsn) as conn:
+        runs = conn.execute("""SELECT id,project_id FROM runs WHERE pr_url IS NOT NULL
+                               AND (pr_state IS NULL OR pr_state='open')
+                               AND (pr_checked_at IS NULL OR pr_checked_at < now()-interval '10 minutes')
+                               ORDER BY pr_checked_at NULLS FIRST LIMIT 20""").fetchall()
+    for run in runs:
+        owner = run["project_id"].split("/")[0]
+        query = urllib.parse.urlencode({"head": f"{owner}:teem/{run['id']}", "state": "all"})
+        try:
+            pulls = api(app, "GET", f"/repos/{run['project_id']}/pulls?{query}")
+        except GitHubError:
+            continue
+        pull = pulls[0] if pulls else {}
+        state = "merged" if pull.get("merged_at") else pull.get("state", "open")
+        with connect(app.dsn) as conn:
+            conn.execute("""UPDATE runs SET pr_state=%s,pr_closed_at=%s,pr_checked_at=now() WHERE id=%s""",
+                         (state if state in ("open", "merged", "closed") else "open",
+                          pull.get("merged_at") or pull.get("closed_at"), run["id"]))
+
+
 def publisher_loop(app):
     while not app.stopping.is_set():
         try:
             if publish_due(app):
                 continue
+            check_pull_requests(app)
         except Exception as exc:
             print(f"publisher: {type(exc).__name__}: {exc}", flush=True)
         app.stopping.wait(5)

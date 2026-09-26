@@ -30,7 +30,10 @@ CREATE TABLE IF NOT EXISTS runs (
     updated_at timestamptz NOT NULL DEFAULT now(),
     pr_url text,
     publish_attempts integer NOT NULL DEFAULT 0,
-    next_publish_at timestamptz
+    next_publish_at timestamptz,
+    pr_state text CHECK (pr_state IN ('open','merged','closed')),
+    pr_closed_at timestamptz,
+    pr_checked_at timestamptz
 );
 DROP INDEX IF EXISTS one_active_run_per_project;
 CREATE UNIQUE INDEX one_active_run_per_project ON runs(project_id)
