@@ -8,8 +8,8 @@ from . import decider, github
 from .common import IMPLEMENTER_MODELS, STATUS_LABELS, ApiError
 from .db import connect
 from .speech import MAX_AUDIO, MAX_SECONDS, SpeechError
-from .workflow import (CANCELLABLE, cancel_run, create_run, decide_run, publish_anyway, request_replacement,
-                       retry_review)
+from .workflow import (CANCELLABLE, KEEP_GOING_REVISIONS, cancel_run, create_run, decide_run, keep_going,
+                       publish_anyway, request_replacement, retry_review)
 
 
 API = "https://api.telegram.org"
@@ -269,6 +269,9 @@ def apply_callback(conn, data):
             if parts[0] == "v" and len(parts) == 2:
                 retry_review(conn, parts[1], "telegram_button")
                 return ["Retrying the review of the same Candidate."]
+            if parts[0] == "k" and len(parts) == 2:
+                keep_going(conn, parts[1], "telegram_button")
+                return [f"Keeping going: up to {KEEP_GOING_REVISIONS} more rounds on the same Candidate."]
             if parts[0] == "u" and len(parts) == 2:
                 publish_anyway(conn, parts[1], "telegram_button")
                 return ["Publishing it as a pull request marked as not passing review."]
@@ -363,6 +366,9 @@ def run_update(conn, run_id, origin):
         buttons = [[{"text": "Retry review", "callback_data": f"v:{run_id}"}]]
     if run["status"] == "blocked" and run["stop_reason"] in ("revision_limit", "review_uncertain"):
         buttons = [[{"text": "Publish anyway", "callback_data": f"u:{run_id}"}]]
+        if run["stop_reason"] == "revision_limit" and not conn.execute(
+                "SELECT 1 FROM approvals WHERE run_id=%s AND action='extend_revisions'", (run_id,)).fetchone():
+            buttons[0].insert(0, {"text": f"Keep going (+{KEEP_GOING_REVISIONS} rounds)", "callback_data": f"k:{run_id}"})
     if run["status"] == "awaiting_approval":
         checks = ", ".join(check["name"] for check in contract["checks"]) or "none (.teem/checks.json not found)"
         text += (f"\nDone when: {contract['acceptance_criteria'][:600]}\nChecks: {checks}"

@@ -35,7 +35,7 @@ from .review import ReviewInputError, build_context, validate_result
 from .speech import SpeechRunner
 from . import decider, github, stats, telegram
 from .workflow import (cancel_run, create_run, decide_run, reviewer_identity, run_cancelled, status_rows,
-                       stop_run, task_attempt_limit)
+                       run_limit, stop_run, task_attempt_limit)
 
 
 def lock_attempt_rows(conn, attempt_id):
@@ -148,7 +148,7 @@ def prepare_reviews(app):
             if conn.execute("SELECT 1 FROM tasks WHERE run_id=%s AND kind='review' AND revision_number=%s",
                             (run_id, coding["revision_number"])).fetchone():
                 continue
-            if attempt_count(conn, run_id) >= contract["limits"]["attempts"]:
+            if attempt_count(conn, run_id) >= run_limit(conn, run_id, contract, "attempts"):
                 stop_run(conn, run_id, "attempt_limit")
                 continue
             conn.execute("""INSERT INTO tasks(id,run_id,kind,status,revision_number,input_candidate_id,review_context)
@@ -479,8 +479,9 @@ class Handler(BaseHTTPRequestHandler):
                 used = attempt_count(conn, run_id)
                 rounds = max((t["revision_number"] for t in tasks if t["kind"] == "code_and_check"), default=0)
                 seconds_left = max(0, int((run["deadline"] - datetime.now(timezone.utc)).total_seconds()))
-                content += (f"<p>Round: {rounds} · Attempts remaining: {max(0,contract['limits']['attempts']-used)} · "
-                            f"revisions remaining: {max(0,contract['limits']['revisions']-rounds)} · "
+                content += (f"<p>Round: {rounds} · Attempts remaining: "
+                            f"{max(0, run_limit(conn, run_id, contract, 'attempts') - used)} · "
+                            f"revisions remaining: {max(0, run_limit(conn, run_id, contract, 'revisions') - rounds)} · "
                             f"time remaining: {seconds_left} seconds · deadline: {run['deadline'].isoformat()}</p>")
                 if run["status"] == "awaiting_approval":
                     content += (f"<form method='post' action='/runs/{run_id}/approve'>"
@@ -667,7 +668,7 @@ class Handler(BaseHTTPRequestHandler):
                                        LEFT JOIN reviews v ON v.attempt_id=t.source_review_attempt_id
                                        LEFT JOIN candidates parent ON parent.id=t.input_candidate_id
                                        WHERE t.id=%s FOR UPDATE OF t""", (selected["task_id"],)).fetchone()
-                if attempt_count(conn, task["run_id"]) >= task["body"]["limits"]["attempts"]:
+                if attempt_count(conn, task["run_id"]) >= run_limit(conn, task["run_id"], task["body"], "attempts"):
                     conn.execute("UPDATE tasks SET status='cancelled' WHERE id=%s", (task["id"],))
                     stop_run(conn, task["run_id"], "attempt_limit")
                     conn.commit()
@@ -966,8 +967,8 @@ class Handler(BaseHTTPRequestHandler):
                     contract = row["body"]
                     if not any(item["exit_code"] != 0 for item in checks):
                         pass
-                    elif row["revision_number"] < contract["limits"]["revisions"] and \
-                            attempt_count(conn, row["run_id"]) < contract["limits"]["attempts"]:
+                    elif row["revision_number"] < run_limit(conn, row["run_id"], contract, "revisions") and \
+                            attempt_count(conn, row["run_id"]) < run_limit(conn, row["run_id"], contract, "attempts"):
                         conn.execute("""INSERT INTO tasks(id,run_id,kind,status,revision_number,input_candidate_id)
                                         VALUES (%s,%s,'code_and_check','queued',%s,%s)""",
                                      (new_id(), row["run_id"], row["revision_number"] + 1, candidate_id))
@@ -1000,10 +1001,10 @@ class Handler(BaseHTTPRequestHandler):
                         conn.execute("UPDATE runs SET stop_reason='review_uncertain' WHERE id=%s", (row["run_id"],))
                     else:
                         contract = row["body"]
-                        if row["revision_number"] >= contract["limits"]["revisions"]:
+                        if row["revision_number"] >= run_limit(conn, row["run_id"], contract, "revisions"):
                             status = "blocked"
                             conn.execute("UPDATE runs SET stop_reason='revision_limit' WHERE id=%s", (row["run_id"],))
-                        elif attempt_count(conn, row["run_id"]) >= contract["limits"]["attempts"]:
+                        elif attempt_count(conn, row["run_id"]) >= run_limit(conn, row["run_id"], contract, "attempts"):
                             status = "blocked"
                             conn.execute("UPDATE runs SET stop_reason='attempt_limit' WHERE id=%s", (row["run_id"],))
                         else:
@@ -1018,9 +1019,9 @@ class Handler(BaseHTTPRequestHandler):
                                   "failed" if outcome == "review" and error else outcome)
                 if status == "failed" and outcome != "candidate":
                     if row["generation"] < task_attempt_limit(conn, row) and \
-                            attempt_count(conn, row["run_id"]) < row["body"]["limits"]["attempts"]:
+                            attempt_count(conn, row["run_id"]) < run_limit(conn, row["run_id"], row["body"], "attempts"):
                         status = "awaiting_review" if row["kind"] == "review" else "queued"
-                    elif attempt_count(conn, row["run_id"]) >= row["body"]["limits"]["attempts"]:
+                    elif attempt_count(conn, row["run_id"]) >= run_limit(conn, row["run_id"], row["body"], "attempts"):
                         status = "blocked"
                         conn.execute("UPDATE runs SET stop_reason='attempt_limit' WHERE id=%s", (row["run_id"],))
                 conn.execute("UPDATE attempts SET status=%s,finished_at=now(),usage=%s::jsonb,result_sha256=%s WHERE id=%s",

@@ -136,7 +136,7 @@ When a Run stops, the check-in says why:
 
 - **A failure** shows its last error, such as a provider's 401.
 - **A reviewer failure** offers **Retry review**, which reviews the same Candidate again without redoing the implementation. Each Run gets one retry, adding two review attempts.
-- **A Run stopped at review** (revision limit or an uncertain reviewer) shows the review summary and top findings, and offers **Publish anyway**. That opens the pull request titled "review not passed", with the open findings in its description. Both buttons are recorded as Approvals.
+- **A Run stopped at review** (revision limit or an uncertain reviewer) shows the review summary and top findings, and offers **Publish anyway**. At the revision limit it also offers **Keep going**, which grants two more rounds (and four more Attempts) on the same Candidate against the last review's findings, once per Run. That opens the pull request titled "review not passed", with the open findings in its description. Both buttons are recorded as Approvals.
 
 If queued work waits 10 minutes while the worker has been silent for five, the bot says so once per Run.
 

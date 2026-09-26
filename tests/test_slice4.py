@@ -686,7 +686,7 @@ class Slice4Acceptance(unittest.TestCase):
         self.drain()
         stop = self.api.state["sent"][-1]
         self.assertIn("Stop reason: revision_limit\nReview: Review completed\n- Outcome missing", stop["text"])
-        self.assertEqual(stop["reply_markup"]["inline_keyboard"][0][0]["callback_data"], f"u:{run_id}")
+        self.assertIn(f"u:{run_id}", [b["callback_data"] for b in stop["reply_markup"]["inline_keyboard"][0]])
         self.deliver(callback(900, f"u:{run_id}"))
         self.assertEqual(self.texts()[-1], "Publishing it as a pull request marked as not passing review.")
         self.assertTrue(github.publish_due(self.server.app))
@@ -759,6 +759,34 @@ class Slice4Acceptance(unittest.TestCase):
         finally:
             with psycopg.connect(self.admin_dsn, autocommit=True) as admin:
                 admin.execute(f'DROP DATABASE "{name}" WITH (FORCE)')
+
+    def test_keep_going_revises_the_same_candidate_after_the_revision_limit(self):
+        # A revision must change something, or the implementer is treated as asking a question.
+        (self.repo / "coder.py").write_text(
+            "import json\nfrom pathlib import Path\n"
+            "contract=json.loads(Path('/contract.json').read_text())\n"
+            "Path('value.txt').write_text('after revised\\n' if contract.get('parent_candidate_id') else 'after\\n')\n")
+        (self.repo / "check.py").write_text("from pathlib import Path\nassert Path('value.txt').read_text().startswith('after')\n")
+        run("git", "add", ".", cwd=self.repo)
+        run("git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "revising coder", cwd=self.repo)
+        self.reviewer_verdict("changes_required")
+        run_id = self.propose(revisions=0).split("/")[-1]
+        first = self.claim_and_execute()
+        review = self.claim_and_execute()
+        self.drain()
+        buttons = self.api.state["sent"][-1]["reply_markup"]["inline_keyboard"][0]
+        self.assertEqual([b["callback_data"] for b in buttons], [f"k:{run_id}", f"u:{run_id}"])
+        self.deliver(callback(1000, f"k:{run_id}"), callback(1001, f"k:{run_id}"))
+        self.assertEqual(self.texts()[-2], "Keeping going: up to 2 more rounds on the same Candidate.")
+        # The second tap finds the Run already moving again.
+        self.assertIn("That decision no longer applies", self.texts()[-1])
+        self.reviewer_verdict("pass")
+        revision = self.claim_and_execute()
+        self.assertEqual((revision["revision_number"], revision["source_review_attempt_id"]), (1, review["attempt_id"]))
+        self.assertEqual(revision["input_candidate_id"], review["input_candidate_id"])
+        self.claim_and_execute()
+        self.assertEqual(self.run_status(run_id)["status"], "ready_to_merge")
+        self.assertIsNotNone(first)
 
 
 if __name__ == "__main__":

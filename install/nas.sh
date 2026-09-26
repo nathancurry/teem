@@ -84,7 +84,16 @@ for name in telegram github decider reviewer; do
     fi
     chown "root:$APPS_GID" "$file" && chmod 640 "$file"
 done
-[ ! -f "$NAS_CONFIG/speech.json" ] || { chown "root:$APPS_GID" "$NAS_CONFIG/speech.json"; chmod 640 "$NAS_CONFIG/speech.json"; }
+if [ -f "$NAS_CONFIG/speech.json" ]; then
+    chown "root:$APPS_GID" "$NAS_CONFIG/speech.json" && chmod 640 "$NAS_CONFIG/speech.json"
+    # speech.json turns voice on; the server refuses to start if its runner or model is missing.
+    for path in $(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); print(c["executable"], c["model"])' \
+                  "$NAS_CONFIG/speech.json"); do
+        host_path="$NAS_SPEECH${path#/srv/teem/speech}"
+        [ -f "$host_path" ] || die "speech.json turns voice on, but $host_path isn't installed. Install it, or
+       disable voice with: mv $NAS_CONFIG/speech.json $NAS_CONFIG/speech.json.disabled"
+    done
+fi
 [ -z "$missing" ] || die "fill in these example files, then re-run:$missing"
 
 if [ -n "$db_initialized" ] && docker ps --format '{{.Names}}' | grep -qx teem-postgres; then

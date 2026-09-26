@@ -143,6 +143,48 @@ def run_cancelled(conn, run_id, reviewer):
     return new_run
 
 
+KEEP_GOING_REVISIONS = 2
+KEEP_GOING_ATTEMPTS = 4
+
+
+def run_limit(conn, run_id, contract, name):
+    """A Run's revision or Attempt limit: the contract's, plus the extension granted by Keep going.
+
+    The contract itself never changes; the extension is the user's recorded decision.
+    """
+    extended = conn.execute("""SELECT 1 FROM approvals WHERE run_id=%s AND action='extend_revisions'
+                               AND decision='approve'""", (run_id,)).fetchone()
+    extra = {"revisions": KEEP_GOING_REVISIONS, "attempts": KEEP_GOING_ATTEMPTS}[name] if extended else 0
+    return contract["limits"][name] + extra
+
+
+def keep_going(conn, run_id, source):
+    """After a Run stopped at its revision limit, grant two more rounds and revise the same Candidate
+    against the last review's findings."""
+    run = conn.execute("SELECT * FROM runs WHERE id=%s FOR UPDATE", (run_id,)).fetchone()
+    if not run:
+        fail(404, "run not found")
+    if run["status"] != "blocked" or run["stop_reason"] != "revision_limit":
+        fail(409, "only a Run stopped at its revision limit can keep going")
+    if conn.execute("SELECT 1 FROM approvals WHERE run_id=%s AND action='extend_revisions'", (run_id,)).fetchone():
+        fail(409, "this Run already kept going once")
+    review = conn.execute("""SELECT v.attempt_id,t.revision_number FROM reviews v JOIN attempts a ON a.id=v.attempt_id
+                             JOIN tasks t ON t.id=a.task_id WHERE t.run_id=%s AND t.input_candidate_id=%s
+                             AND v.disposition='accepted' AND v.result->>'verdict'='changes_required'
+                             ORDER BY v.created_at DESC LIMIT 1""", (run_id, run["current_candidate_id"])).fetchone()
+    if not review:
+        fail(409, "no accepted review of the current Candidate asks for changes")
+    record_decision(conn, run, "extend_revisions", source)
+    conn.execute("""INSERT INTO tasks(id,run_id,kind,status,revision_number,input_candidate_id,source_review_attempt_id)
+                    VALUES (%s,%s,'code_and_check','queued',%s,%s,%s)""",
+                 (new_id(), run_id, review["revision_number"] + 1, run["current_candidate_id"], review["attempt_id"]))
+    # Two more rounds need time; extend without ever shortening the deadline.
+    conn.execute("""UPDATE runs SET status='queued',stop_reason=NULL,updated_at=now(),
+                    deadline=GREATEST(deadline,now()+interval '2 hours') WHERE id=%s""", (run_id,))
+    event(conn, run_id, "revision_queued", {"parent_candidate_id": str(run["current_candidate_id"]),
+                                            "round": review["revision_number"] + 1, "reason": "keep_going"})
+
+
 def task_attempt_limit(conn, task):
     """Two Attempts per Task. A review Task the user chose to retry gets two more."""
     if task["kind"] == "review" and conn.execute("""SELECT 1 FROM approvals WHERE run_id=%s
@@ -176,7 +218,7 @@ def retry_review(conn, run_id, source):
                            WHERE t.run_id=%s""", (run_id,)).fetchone()["n"]
     body = conn.execute("SELECT body FROM contracts WHERE run_id=%s AND version=%s",
                         (run_id, run["contract_version"])).fetchone()["body"]
-    if used >= body["limits"]["attempts"]:
+    if used >= run_limit(conn, run_id, body, "attempts"):
         fail(409, "the Run's attempt limit is reached")
     if conn.execute("SELECT 1 FROM approvals WHERE run_id=%s AND action='retry_review'", (run_id,)).fetchone():
         fail(409, "this review was already retried once")
