@@ -1,6 +1,7 @@
 """Slice-4 acceptance paths against real HTTP, PostgreSQL, FFmpeg, Bubblewrap, and a fake Bot API."""
 
 import hashlib
+import http.client
 import json
 import subprocess
 import threading
@@ -10,6 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer as HTTPServe
 import os
 from pathlib import Path
 from unittest.mock import patch
+from urllib.parse import quote, urlencode, urlparse
 
 from teem import github, telegram
 from teem.db import connect
@@ -569,6 +571,39 @@ class Slice4Acceptance(unittest.TestCase):
         self.assertEqual(self.run_status(run_id)["stop_reason"], "grant_revoked")
         self.assertEqual(self.github_api.pulls, [])
         self.assertEqual(run("git", "branch", "--list", "teem/*", cwd=self.repo), "")
+
+    def request(self, method, path, body=None, headers=None):
+        parsed = urlparse(self.url)
+        conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=10)
+        conn.request(method, path, urlencode(body) if body is not None else None,
+                     {"Content-Type": "application/x-www-form-urlencoded", **(headers or {})})
+        response = conn.getresponse()
+        result = response.status, response.headers, response.read()
+        conn.close()
+        return result
+
+    def test_sign_in_form_sets_a_session_for_pages_and_decisions(self):
+        run_path = self.propose(revisions=0)
+        status, headers, _ = self.request("GET", run_path)
+        self.assertEqual((status, headers["Location"]), (303, "/login?next=" + quote(run_path, safe="")))
+        self.assertEqual(self.request("GET", "/state")[0], 401)
+        form = {"username": "user", "password": "password", "next": run_path}
+        origin = {"Origin": "https://teem.test"}
+        self.assertEqual(self.request("POST", "/login", form)[0], 403)
+        status, headers, _ = self.request("POST", "/login", {**form, "password": "wrong"}, origin)
+        self.assertEqual((status, headers["Set-Cookie"]), (401, None))
+        status, headers, _ = self.request("POST", "/login", {**form, "next": "//evil.test/"}, origin)
+        self.assertEqual(headers["Location"], "/")
+        status, headers, _ = self.request("POST", "/login", form, origin)
+        self.assertEqual((status, headers["Location"]), (303, run_path))
+        cookie = {"Cookie": headers["Set-Cookie"].split(";", 1)[0]}
+        self.assertIn("HttpOnly", headers["Set-Cookie"])
+        self.assertEqual(self.request("GET", run_path, headers=cookie)[0], 200)
+        self.assertEqual(self.request("POST", run_path + "/cancel", {}, cookie)[0], 403)
+        self.assertEqual(self.request("POST", run_path + "/cancel", {}, {**cookie, **origin})[0], 303)
+        expires, signature = cookie["Cookie"].split("=", 1)[1].split(".")
+        forged = {"Cookie": f"teem_session={int(expires) + 1}.{signature}"}
+        self.assertEqual(self.request("GET", run_path, headers=forged)[0], 303)
 
 
 if __name__ == "__main__":

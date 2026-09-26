@@ -8,10 +8,12 @@ import os
 import subprocess
 import tempfile
 import threading
+import time
 from datetime import datetime, timezone
+from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer as HTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 import psycopg
 
@@ -170,7 +172,10 @@ def assignment(row):
             "deadline": row["deadline"].isoformat()}
 
 
-def page(title, content):
+SESSION_SECONDS = 30 * 24 * 3600
+
+
+def page(title, content, script=True):
     return ("<!doctype html><html lang='en'><meta charset='utf-8'>"
             "<meta name='viewport' content='width=device-width,initial-scale=1'>"
             "<meta name='theme-color' content='#172337'>"
@@ -182,7 +187,17 @@ def page(title, content):
             "label{display:block;margin:.8rem 0}pre{white-space:pre-wrap;background:#eee;padding:1rem}"
             "li{margin:.5rem 0}a{color:#064c9e}</style>"
             "<header><a href='/'>Teem</a></header>" + content +
-            "<script src='/phone.js' defer></script></html>").encode()
+            ("<script src='/phone.js' defer></script>" if script else "") + "</html>").encode()
+
+
+def login_page(next_path, error=""):
+    return page("Sign in to Teem", (
+        "<h1>Sign in</h1>" + (f"<p role='alert'>{html.escape(error)}</p>" if error else "") +
+        "<form method='post' action='/login'>"
+        "<label>Username <input name='username' autocomplete='username' autocapitalize='none' required></label>"
+        "<label>Password <input type='password' name='password' autocomplete='current-password' required></label>"
+        f"<input type='hidden' name='next' value='{html.escape(next_path)}'>"
+        "<button>Sign in</button></form>"), script=False)
 
 
 class ThreadingHTTPServer(HTTPServer):
@@ -228,15 +243,55 @@ class Handler(BaseHTTPRequestHandler):
             expected = "Basic " + base64.b64encode(
                 (self.app.username + ":" + self.app.password).encode()
             ).decode()
-            if not hmac.compare_digest(value, expected):
-                self.send_response(401)
-                self.send_header("WWW-Authenticate", 'Basic realm="Teem"')
-                self.send_header("Content-Length", "0")
-                self.end_headers()
+            if not hmac.compare_digest(value, expected) and not self.valid_session():
+                path = urlparse(self.path).path
+                if self.command == "GET" and not path.endswith("/state"):
+                    # Pages send the browser to the sign-in form, then back here.
+                    self.redirect("/login?" + urlencode({"next": self.path}))
+                else:
+                    self.respond(401, {"error": "sign in required"})
                 return False
             if self.command == "POST" and self.headers.get("Origin") != self.app.origin:
                 fail(403, "same-origin decision required")
         return True
+
+    def session_signature(self, expires):
+        # Derived from the password, so changing the password signs every browser out.
+        key = hmac.new(self.app.password.encode(), b"teem-session", hashlib.sha256).digest()
+        return hmac.new(key, str(expires).encode(), hashlib.sha256).hexdigest()
+
+    def valid_session(self):
+        cookie = SimpleCookie()
+        try:
+            cookie.load(self.headers.get("Cookie", ""))
+        except CookieError:
+            return False
+        if "teem_session" not in cookie:
+            return False
+        expires, _, signature = cookie["teem_session"].value.partition(".")
+        return expires.isdigit() and int(expires) > time.time() and \
+            hmac.compare_digest(signature, self.session_signature(int(expires)))
+
+    def login(self):
+        if self.headers.get("Origin") != self.app.origin:
+            fail(403, "same-origin sign-in required")
+        form = self.form()
+        next_path = form.get("next", "/")
+        if not next_path.startswith("/") or next_path.startswith("//"):
+            next_path = "/"
+        valid = hmac.compare_digest(form.get("username", ""), self.app.username) & \
+            hmac.compare_digest(form.get("password", ""), self.app.password)
+        if not valid:
+            time.sleep(1)  # slows guessing without keeping any lockout state
+            self.respond(401, login_page(next_path, "Wrong username or password."), "text/html; charset=utf-8")
+            return
+        expires = int(time.time()) + SESSION_SECONDS
+        self.send_response(303)
+        self.send_header("Location", next_path)
+        self.send_header("Set-Cookie", f"teem_session={expires}.{self.session_signature(expires)}; Path=/; "
+                                       f"Max-Age={SESSION_SECONDS}; HttpOnly; Secure; SameSite=Lax")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def body(self, limit=65536):
         try:
@@ -267,6 +322,10 @@ class Handler(BaseHTTPRequestHandler):
             path = urlparse(self.path).path
             if path in ("/manifest.webmanifest", "/icon.svg", "/icon-192.png", "/icon-512.png", "/phone.js"):
                 self.static_get(path)
+                return
+            if path == "/login":
+                next_path = parse_qs(urlparse(self.path).query).get("next", ["/"])[0]
+                self.respond(200, login_page(next_path), "text/html; charset=utf-8")
                 return
             if path.startswith("/worker/"):
                 if not self.auth(worker=True):
@@ -322,6 +381,8 @@ class Handler(BaseHTTPRequestHandler):
                 if not self.auth(worker=True):
                     return
                 self.worker_post(path)
+            elif path == "/login":
+                self.login()
             else:
                 if not self.auth():
                     return

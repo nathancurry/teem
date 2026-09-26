@@ -56,7 +56,7 @@ teem-server serve --dsn "$TEEM_DSN" --artifacts /srv/teem/artifacts --username "
   --speech-config speech.json --speech-scratch /srv/teem/speech-scratch
 ```
 
-The server binds to `127.0.0.1:8765`. The HTTPS proxy must forward `Authorization` and `Origin`. Evidence pages need Basic authentication and same-origin POSTs. Workers use a separate bearer token and protocol version 3. The server needs outbound HTTPS to `api.telegram.org`, `openrouter.ai`, `github.com`, and `api.github.com`. It keeps rebuildable repository mirrors under `<artifacts>/mirrors`.
+The server binds to `127.0.0.1:8765`. The HTTPS proxy must forward `Authorization` and `Origin`. Evidence pages use a sign-in form (so password managers can fill it) that sets a signed, HttpOnly session cookie for 30 days; changing the password signs every browser out. Basic authentication still works for scripts. Every browser POST must be same-origin. Workers use a separate bearer token and protocol version 3. The server needs outbound HTTPS to `api.telegram.org`, `openrouter.ai`, `github.com`, and `api.github.com`. It keeps rebuildable repository mirrors under `<artifacts>/mirrors`.
 
 ## Worker setup
 
